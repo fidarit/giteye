@@ -22,11 +22,53 @@ type Config struct {
 	NotifyOnFailure      bool                    `yaml:"notify_on_failure"`
 	MaxConcurrentReviews int                     `yaml:"max_concurrent_reviews"`
 	MaxToolRounds        int                     `yaml:"max_tool_rounds"`
+	Limits               Limits                  `yaml:"limits"`
 	ReviewLanguage       string                  `yaml:"review_language"`
 	SystemPromptOverride string                  `yaml:"system_prompt_override"`
 	SystemPromptAddition string                  `yaml:"system_prompt_addition"`
 	Repositories         map[string]RepoOverride `yaml:"repositories"`
 }
+
+type Limits struct {
+	WebhookPayloadBytes      int `yaml:"webhook_payload_bytes"`
+	ReviewContextBytes       int `yaml:"review_context_bytes"`
+	GiteaReviewCommentsBytes int `yaml:"gitea_review_comments_bytes"`
+	MCPToolResultBytes       int `yaml:"mcp_tool_result_bytes"`
+	MCPToolListPages         int `yaml:"mcp_tool_list_pages"`
+	MCPDiscoveredTools       int `yaml:"mcp_discovered_tools"`
+	MCPExposedTools          int `yaml:"mcp_exposed_tools"`
+	MCPToolSchemaBytes       int `yaml:"mcp_tool_schema_bytes"`
+	MCPTotalSchemaBytes      int `yaml:"mcp_total_schema_bytes"`
+}
+
+func DefaultLimits() Limits {
+	return Limits{
+		WebhookPayloadBytes:      2 << 20,
+		ReviewContextBytes:       256 << 10,
+		GiteaReviewCommentsBytes: 32 << 20,
+		MCPToolResultBytes:       64 << 10,
+		MCPToolListPages:         32,
+		MCPDiscoveredTools:       256,
+		MCPExposedTools:          128,
+		MCPToolSchemaBytes:       64 << 10,
+		MCPTotalSchemaBytes:      256 << 10,
+	}
+}
+
+func (l Limits) WithDefaults() Limits {
+	d := DefaultLimits()
+	l.WebhookPayloadBytes = positiveOr(l.WebhookPayloadBytes, d.WebhookPayloadBytes)
+	l.ReviewContextBytes = positiveOr(l.ReviewContextBytes, d.ReviewContextBytes)
+	l.GiteaReviewCommentsBytes = positiveOr(l.GiteaReviewCommentsBytes, d.GiteaReviewCommentsBytes)
+	l.MCPToolResultBytes = positiveOr(l.MCPToolResultBytes, d.MCPToolResultBytes)
+	l.MCPToolListPages = positiveOr(l.MCPToolListPages, d.MCPToolListPages)
+	l.MCPDiscoveredTools = positiveOr(l.MCPDiscoveredTools, d.MCPDiscoveredTools)
+	l.MCPExposedTools = positiveOr(l.MCPExposedTools, d.MCPExposedTools)
+	l.MCPToolSchemaBytes = positiveOr(l.MCPToolSchemaBytes, d.MCPToolSchemaBytes)
+	l.MCPTotalSchemaBytes = positiveOr(l.MCPTotalSchemaBytes, d.MCPTotalSchemaBytes)
+	return l
+}
+
 type Gitea struct {
 	URL         string `yaml:"url"`
 	Token       string `yaml:"token"`
@@ -41,9 +83,10 @@ type AI struct {
 	Model   string `yaml:"model"`
 }
 type MCP struct {
-	URL        string `yaml:"url"`
-	Token      string `yaml:"token"`
-	AuthHeader string `yaml:"auth_header"`
+	URL          string   `yaml:"url"`
+	Token        string   `yaml:"token"`
+	AuthHeader   string   `yaml:"auth_header"`
+	AllowedTools []string `yaml:"allowed_tools"`
 }
 type RepoOverride struct {
 	ReviewLanguage       string `yaml:"review_language"`
@@ -59,14 +102,43 @@ type ReviewSettings struct {
 	NotifyOnFailure      bool
 }
 
-func Load(path string) (Config, error) {
-	c := Config{
+func Defaults() Config {
+	return Config{
 		ListenAddr:           ":8080",
 		NotifyOnFailure:      true,
 		MaxConcurrentReviews: 4,
 		MaxToolRounds:        6,
+		Limits:               DefaultLimits(),
 		ReviewLanguage:       "ru",
 	}
+}
+
+func (c Config) WithDefaults() Config {
+	d := Defaults()
+	c.ListenAddr = stringOr(c.ListenAddr, d.ListenAddr)
+	c.MaxConcurrentReviews = positiveOr(c.MaxConcurrentReviews, d.MaxConcurrentReviews)
+	c.MaxToolRounds = positiveOr(c.MaxToolRounds, d.MaxToolRounds)
+	c.Limits = c.Limits.WithDefaults()
+	c.ReviewLanguage = stringOr(c.ReviewLanguage, d.ReviewLanguage)
+	return c
+}
+
+func positiveOr(value, fallback int) int {
+	if value > 0 {
+		return value
+	}
+	return fallback
+}
+
+func stringOr(value, fallback string) string {
+	if value != "" {
+		return value
+	}
+	return fallback
+}
+
+func Load(path string) (Config, error) {
+	c := Defaults()
 	if path != "" {
 		b, err := os.ReadFile(path)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -88,18 +160,7 @@ func Load(path string) (Config, error) {
 		}
 	}
 	applyEnv(&c)
-	if c.ListenAddr == "" {
-		c.ListenAddr = ":8080"
-	}
-	if c.MaxConcurrentReviews <= 0 {
-		c.MaxConcurrentReviews = 4
-	}
-	if c.MaxToolRounds <= 0 {
-		c.MaxToolRounds = 6
-	}
-	if c.ReviewLanguage == "" {
-		c.ReviewLanguage = "ru"
-	}
+	c = c.WithDefaults()
 	c.Gitea.URL = strings.TrimRight(c.Gitea.URL, "/")
 	c.AI.BaseURL = strings.TrimRight(c.AI.BaseURL, "/")
 	if c.Webhook.Secret == "" {
@@ -166,12 +227,20 @@ func applyEnv(c *Config) {
 			*target = value
 		}
 	}
+	if value, ok := os.LookupEnv("MCP_ALLOWED_TOOLS"); ok {
+		c.MCP.AllowedTools = nil
+		for _, name := range strings.Split(value, ",") {
+			if name = strings.TrimSpace(name); name != "" {
+				c.MCP.AllowedTools = append(c.MCP.AllowedTools, name)
+			}
+		}
+	}
 }
 
 func validateHTTPURL(name, value string) error {
 	parsed, err := url.ParseRequestURI(value)
-	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Hostname() == "" {
-		return fmt.Errorf("%s must be an absolute HTTP or HTTPS URL", name)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Hostname() == "" || parsed.User != nil {
+		return fmt.Errorf("%s must be an absolute HTTP or HTTPS URL without embedded credentials", name)
 	}
 	return nil
 }

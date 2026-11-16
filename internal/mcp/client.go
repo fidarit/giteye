@@ -2,6 +2,7 @@ package mcpbridge
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -14,6 +15,7 @@ type Tool struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
 	InputSchema any    `json:"inputSchema"`
+	ReadOnly    bool   `json:"-"`
 }
 
 type Client struct {
@@ -66,20 +68,46 @@ func (t headerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	return t.base.RoundTrip(q)
 }
 
-func List(ctx context.Context, session *Session) ([]Tool, error) {
+func List(ctx context.Context, session *Session, maxPages, maxTools int) ([]Tool, error) {
 	if session == nil || session.client == nil {
 		return nil, errors.New("MCP session is not connected")
+	}
+	if maxPages < 1 || maxTools < 1 {
+		return nil, errors.New("MCP discovery limits must be positive")
 	}
 	var out []Tool
 	cursor := ""
 	seenCursors := map[string]struct{}{}
+	pages := 0
 	for {
+		if pages >= maxPages {
+			return nil, errors.New("MCP tools list exceeded the page limit")
+		}
+		pages++
 		res, err := session.client.ListTools(ctx, &mcp.ListToolsParams{Cursor: cursor})
 		if err != nil {
 			return nil, err
 		}
+		if len(res.Tools) > maxTools-len(out) {
+			return nil, errors.New("MCP tools list exceeded the tool limit")
+		}
 		for _, t := range res.Tools {
-			out = append(out, Tool{Name: t.Name, Description: t.Description, InputSchema: t.InputSchema})
+			metadata, err := json.Marshal(t)
+			if err != nil {
+				return nil, err
+			}
+			var annotations struct {
+				Annotations struct {
+					ReadOnlyHint bool `json:"readOnlyHint"`
+				} `json:"annotations"`
+			}
+			if err := json.Unmarshal(metadata, &annotations); err != nil {
+				return nil, err
+			}
+			out = append(out, Tool{
+				Name: t.Name, Description: t.Description, InputSchema: t.InputSchema,
+				ReadOnly: annotations.Annotations.ReadOnlyHint,
+			})
 		}
 		if res.NextCursor == "" {
 			break

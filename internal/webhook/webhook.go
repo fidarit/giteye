@@ -12,8 +12,6 @@ import (
 )
 
 const (
-	// MaxPayloadBytes bounds memory use while decoding incoming webhooks.
-	MaxPayloadBytes               = 2 << 20
 	EventPullRequestReviewRequest = "pull_request_review_request"
 	EventPullRequestComment       = "pull_request_comment"
 	EventPullRequestReviewComment = "pull_request_review_comment"

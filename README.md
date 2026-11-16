@@ -68,6 +68,7 @@ Giteye reads `config.yaml` from the working directory by default. If the file do
 | `mcp.url` | No | Empty (disabled) | Streamable HTTP URL for an optional MCP server. |
 | `mcp.token` | No | Empty | Optional token sent to the MCP server. |
 | `mcp.auth_header` | No | `Authorization` when a token is set | Header name for `mcp.token`. For `Authorization`, a token without a scheme is sent as `Bearer <token>`. |
+| `mcp.allowed_tools` | No | Empty | Exact MCP tool names explicitly allowed even when they are not marked read-only by the server. |
 | `notify_on_failure` | No | `true` | Post a generic PR comment after a hard review failure. |
 | `max_concurrent_reviews` | No | `4` | Maximum number of active reviews across all PRs. Values below 1 use the default. |
 | `max_tool_rounds` | No | `6` | Maximum number of AI rounds that may request MCP tools. Values below 1 use the default. |
@@ -75,6 +76,20 @@ Giteye reads `config.yaml` from the working directory by default. If the file do
 | `system_prompt_override` | No | Empty | Replace the complete default system prompt. |
 | `system_prompt_addition` | No | Empty | Append instructions after the selected system prompt. |
 | `repositories` | No | Empty | Per-repository settings keyed by `owner/repo`. |
+
+All byte and MCP discovery limits are under `limits`. Values are bytes unless the key says otherwise. A value below 1 uses the default; limits cannot be disabled with zero.
+
+| YAML key | Default | Purpose |
+| --- | ---: | --- |
+| `limits.webhook_payload_bytes` | `2097152` (2 MiB) | Maximum signed webhook body size. |
+| `limits.review_context_bytes` | `262144` (256 KiB) | Maximum PR context sent to the AI endpoint. |
+| `limits.gitea_review_comments_bytes` | `33554432` (32 MiB) | Maximum response size for each inline review-comment API page. |
+| `limits.mcp_tool_result_bytes` | `65536` (64 KiB) | Maximum result size forwarded from an MCP tool to the model. |
+| `limits.mcp_tool_list_pages` | `32` | Maximum pages read during MCP tool discovery. |
+| `limits.mcp_discovered_tools` | `256` | Maximum tools accepted from MCP discovery. |
+| `limits.mcp_exposed_tools` | `128` | Maximum tool schemas sent to the model. |
+| `limits.mcp_tool_schema_bytes` | `65536` (64 KiB) | Maximum size of one MCP tool schema. |
+| `limits.mcp_total_schema_bytes` | `262144` (256 KiB) | Maximum combined size of schemas sent to the model. |
 
 Per-repository entries support `review_language`, `system_prompt_override`, `system_prompt_addition`, and `notify_on_failure`. A repository value overrides the corresponding global setting; omitted values inherit it. Example:
 
@@ -103,6 +118,7 @@ These variables override the corresponding global YAML setting:
 | `MCP_URL` | `mcp.url` |
 | `MCP_TOKEN` | `mcp.token` |
 | `MCP_AUTH_HEADER` | `mcp.auth_header` |
+| `MCP_ALLOWED_TOOLS` | `mcp.allowed_tools` (comma-separated) |
 | `REVIEW_LANGUAGE` | `review_language` |
 
 There are no environment overrides for prompts, notification policy, concurrency, tool rounds, or per-repository settings; configure those in YAML. See [config.example.yaml](config.example.yaml) and [.env.example](.env.example) for complete examples.
@@ -123,10 +139,13 @@ Gitea webhook ──signed event──> Giteye ──PR data and diff──> Git
 - Giteye has no database or persistent review cache. Active review context exists in process memory while work runs. Delivery IDs are kept in memory and entries older than 24 hours are pruned when another review event is accepted; a process restart clears the cache.
 - Reviews and comments posted by Giteye are stored by Gitea. AI and MCP providers may retain requests or tool data under their own policies. Choose endpoints and provider settings appropriate for the code and discussion data in your repositories.
 - Logs go to standard output. They include PR identifiers, event type, duration, tool-call counts, token usage when available, and failure causes. Review diffs and prompts are not logged. Configured credentials are redacted from error messages.
+- The `limits` section controls request and context sizes, MCP discovery, and tool schemas/results. Defaults are shown above.
 
 ## MCP
 
-MCP is optional. An empty `mcp.url` disables it; reviews then use webhook and Gitea API context only. When enabled, Giteye connects over Streamable HTTP, discovers tools with `tools/list`, maps their schemas to OpenAI-compatible tools, and calls selected tools by their discovered names. Tool names and schemas are not hardcoded. MCP connection or discovery failures are logged and the review continues without tools.
+MCP is optional. An empty `mcp.url` disables it; reviews then use webhook and Gitea API context only. When enabled, Giteye connects over Streamable HTTP and discovers tools with `tools/list`. By default, only tools declaring the MCP `readOnlyHint` annotation are offered to the model. Add exact names to `mcp.allowed_tools` only when you trust those tools and intend to allow them; this also opts in tools without a read-only annotation. Tool names and schemas are not hardcoded. MCP connection or discovery failures are logged and the review continues without tools.
+
+Treat the configured MCP endpoint as trusted: tool annotations are supplied by that server and are not a security boundary. Giteye sends tool arguments to the selected MCP server and sends returned results to the AI endpoint. Do not configure an MCP server with write-capable tools unless you explicitly allow them and accept that risk.
 
 ## Run from source
 

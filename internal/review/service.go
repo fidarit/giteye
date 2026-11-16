@@ -36,18 +36,22 @@ type Service struct {
 }
 
 func NewService(c config.Config, logger *slog.Logger) (*Service, error) {
+	c.Limits = c.Limits.WithDefaults()
 	if logger == nil {
 		logger = slog.Default()
 	}
-	giteaClient, err := gitea.New(c.Gitea.URL, c.Gitea.Token)
+	giteaClient, err := gitea.New(c.Gitea.URL, c.Gitea.Token, c.Limits.GiteaReviewCommentsBytes)
 	if err != nil {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Service{
-		cfg:     c,
-		gitea:   giteaClient,
-		ai:      llm.New(llm.Config{BaseURL: c.AI.BaseURL, APIKey: c.AI.APIKey, Model: c.AI.Model, MaxToolRounds: c.MaxToolRounds}),
+		cfg:   c,
+		gitea: giteaClient,
+		ai: llm.New(llm.Config{
+			BaseURL: c.AI.BaseURL, APIKey: c.AI.APIKey, Model: c.AI.Model,
+			MaxToolRounds: c.MaxToolRounds, MaxToolResultBytes: c.Limits.MCPToolResultBytes,
+		}),
 		manager: NewManager(c.MaxConcurrentReviews),
 		log:     logger,
 		ctx:     ctx,
@@ -66,7 +70,7 @@ func (s *Service) Handler() http.Handler {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
 	})
-	mux.Handle("POST /webhook", webhook.Handler(s.cfg.Webhook.Secret, webhook.MaxPayloadBytes, func(w http.ResponseWriter, r *http.Request, body []byte) { s.accept(w, r, body) }))
+	mux.Handle("POST /webhook", webhook.Handler(s.cfg.Webhook.Secret, int64(s.cfg.Limits.WebhookPayloadBytes), func(w http.ResponseWriter, r *http.Request, body []byte) { s.accept(w, r, body) }))
 	return mux
 }
 
@@ -147,7 +151,7 @@ func (s *Service) safeError(err error) string {
 	}
 	cause := strings.TrimSpace(err.Error())
 	for _, secret := range []string{s.cfg.Gitea.Token, s.cfg.Webhook.Secret, s.cfg.AI.APIKey, s.cfg.MCP.Token} {
-		if len(secret) >= 4 {
+		if secret != "" {
 			cause = strings.ReplaceAll(cause, secret, "[redacted]")
 		}
 	}
@@ -228,6 +232,9 @@ func (s *Service) run(ctx context.Context, o, r string, n int64, kind webhook.Tr
 		targetID = root.ID
 		user += "\n\nActive bot thread:\n" + threadContext(root, e.Comment, d.ReviewComments)
 	}
+	if len(user) > s.cfg.Limits.ReviewContextBytes {
+		return llm.Usage{}, fmt.Errorf("review context exceeds the %d-byte safety limit", s.cfg.Limits.ReviewContextBytes)
+	}
 	session, tools, toolNames, err := s.discoverMCPTools(ctx)
 	if err != nil {
 		s.log.Warn("MCP unavailable; continuing with diff-only review", "cause", s.safeError(err))
@@ -296,7 +303,8 @@ func (s *Service) discoverMCPTools(ctx context.Context) (*mcpbridge.Session, []l
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	discovered, err := mcpbridge.List(ctx, session)
+	limits := s.cfg.Limits
+	discovered, err := mcpbridge.List(ctx, session, limits.MCPToolListPages, limits.MCPDiscoveredTools)
 	if err != nil {
 		closeErr := session.Close()
 		return nil, nil, nil, errors.Join(fmt.Errorf("list MCP tools: %w", err), closeErr)
@@ -307,10 +315,20 @@ func (s *Service) discoverMCPTools(ctx context.Context) (*mcpbridge.Session, []l
 		}
 		return nil, nil, nil, nil
 	}
+	allowedTools := make(map[string]struct{}, len(s.cfg.MCP.AllowedTools))
+	for _, name := range s.cfg.MCP.AllowedTools {
+		allowedTools[name] = struct{}{}
+	}
 
 	tools := make([]llm.Tool, 0, len(discovered))
 	toolNames := make(map[string]string, len(discovered))
+	var schemaBytes int
 	for _, discoveredTool := range discovered {
+		_, explicitlyAllowed := allowedTools[discoveredTool.Name]
+		if !discoveredTool.ReadOnly && !explicitlyAllowed {
+			s.log.Warn("skipping MCP tool without read-only annotation", "tool", discoveredTool.Name)
+			continue
+		}
 		schema, err := json.Marshal(discoveredTool.InputSchema)
 		if err != nil {
 			closeErr := session.Close()
@@ -319,6 +337,11 @@ func (s *Service) discoverMCPTools(ctx context.Context) (*mcpbridge.Session, []l
 		if len(schema) == 0 || string(schema) == "null" {
 			schema = json.RawMessage(`{"type":"object"}`)
 		}
+		if len(schema) > limits.MCPToolSchemaBytes || schemaBytes+len(schema) > limits.MCPTotalSchemaBytes || len(tools) >= limits.MCPExposedTools {
+			s.log.Warn("skipping MCP tool that exceeds schema limits", "tool", discoveredTool.Name)
+			continue
+		}
+		schemaBytes += len(schema)
 		name := openAIToolName(discoveredTool.Name, toolNames)
 		toolNames[name] = discoveredTool.Name
 		tools = append(tools, llm.Tool{
@@ -328,6 +351,12 @@ func (s *Service) discoverMCPTools(ctx context.Context) (*mcpbridge.Session, []l
 				Parameters: schema,
 			},
 		})
+	}
+	if len(tools) == 0 {
+		if err := session.Close(); err != nil {
+			return nil, nil, nil, fmt.Errorf("close MCP session: %w", err)
+		}
+		return nil, nil, nil, nil
 	}
 	return session, tools, toolNames, nil
 }

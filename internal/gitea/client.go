@@ -15,10 +15,11 @@ import (
 )
 
 type Client struct {
-	api     *sdk.Client
-	baseURL string
-	token   string
-	http    *http.Client
+	api              *sdk.Client
+	baseURL          string
+	token            string
+	http             *http.Client
+	maxResponseBytes int
 }
 
 type User struct {
@@ -78,14 +79,17 @@ const (
 	ReviewEventApprove ReviewEvent = "APPROVED"
 )
 
-func New(baseURL, token string) (*Client, error) {
+func New(baseURL, token string, maxResponseBytes int) (*Client, error) {
+	if maxResponseBytes <= 0 {
+		maxResponseBytes = 32 << 20
+	}
 	httpClient := &http.Client{Timeout: 30 * time.Second}
 	baseURL = strings.TrimRight(baseURL, "/")
 	api, err := sdk.NewClient(baseURL, sdk.SetToken(token), sdk.SetHTTPClient(httpClient))
 	if err != nil {
 		return nil, fmt.Errorf("initialize Gitea API client: %w", err)
 	}
-	return &Client{api: api, baseURL: baseURL, token: token, http: httpClient}, nil
+	return &Client{api: api, baseURL: baseURL, token: token, http: httpClient, maxResponseBytes: maxResponseBytes}, nil
 }
 
 func (c *Client) Pull(ctx context.Context, owner, repo string, number int64) (PullRequest, error) {
@@ -196,11 +200,17 @@ func (c *Client) listReviewComments(ctx context.Context, owner, repo string, num
 			resp.Body.Close()
 			return nil, fmt.Errorf("Gitea API returned HTTP %d", resp.StatusCode)
 		}
-		var comments []Comment
-		decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 32<<20)).Decode(&comments)
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, int64(c.maxResponseBytes)+1))
 		resp.Body.Close()
-		if decodeErr != nil {
-			return nil, fmt.Errorf("decode Gitea review comments: %w", decodeErr)
+		if readErr != nil {
+			return nil, fmt.Errorf("read Gitea review comments: %w", readErr)
+		}
+		if len(body) > c.maxResponseBytes {
+			return nil, fmt.Errorf("Gitea review comments response exceeds the %d-byte limit", c.maxResponseBytes)
+		}
+		var comments []Comment
+		if err := json.Unmarshal(body, &comments); err != nil {
+			return nil, fmt.Errorf("decode Gitea review comments: %w", err)
 		}
 		out = append(out, comments...)
 		if len(comments) < 50 {

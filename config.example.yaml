@@ -17,6 +17,7 @@ mcp:
   url: ""                 # unset or empty disables MCP
   token: ""
   auth_header: "Authorization"
+  allowed_tools: []        # explicit opt-in for tools not marked read-only by the MCP server
 
 notify_on_failure: true
 max_concurrent_reviews: 4
@@ -24,6 +25,17 @@ max_tool_rounds: 6
 review_language: "ru"
 system_prompt_override: "" # replace the complete default prompt
 system_prompt_addition: "" # append extra instructions to the selected prompt
+
+limits:
+  webhook_payload_bytes: 2097152
+  review_context_bytes: 262144
+  gitea_review_comments_bytes: 33554432
+  mcp_tool_result_bytes: 65536
+  mcp_tool_list_pages: 32
+  mcp_discovered_tools: 256
+  mcp_exposed_tools: 128
+  mcp_tool_schema_bytes: 65536
+  mcp_total_schema_bytes: 262144
 
 repositories:
   example/project:

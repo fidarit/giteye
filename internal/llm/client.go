@@ -16,6 +16,7 @@ import (
 type Config struct {
 	BaseURL, APIKey, Model string
 	MaxToolRounds          int
+	MaxToolResultBytes     int
 }
 
 type Comment struct {
@@ -61,6 +62,9 @@ type Client struct {
 func New(c Config) *Client {
 	if c.MaxToolRounds < 1 {
 		c.MaxToolRounds = 6
+	}
+	if c.MaxToolResultBytes < 1 {
+		c.MaxToolResultBytes = 64 << 10
 	}
 	httpClient := &http.Client{Timeout: 4 * time.Minute}
 	api := openai.NewClient(
@@ -139,7 +143,7 @@ func (c *Client) Review(ctx context.Context, system, user string, tools []Tool, 
 			if callErr != nil {
 				value = map[string]string{"error": callErr.Error()}
 			}
-			content, err := toolContent(value)
+			content, err := toolContent(value, c.cfg.MaxToolResultBytes)
 			if err != nil {
 				return Result{Usage: usage}, err
 			}
@@ -148,13 +152,19 @@ func (c *Client) Review(ctx context.Context, system, user string, tools []Tool, 
 	}
 }
 
-func toolContent(value any) (string, error) {
+func toolContent(value any, maxBytes int) (string, error) {
 	if text, ok := value.(string); ok {
+		if len(text) > maxBytes {
+			return fmt.Sprintf(`{"error":"MCP tool result exceeded the %d-byte limit; request a narrower result"}`, maxBytes), nil
+		}
 		return text, nil
 	}
 	data, err := json.Marshal(value)
 	if err != nil {
 		return "", fmt.Errorf("encode MCP tool result: %w", err)
+	}
+	if len(data) > maxBytes {
+		return fmt.Sprintf(`{"error":"MCP tool result exceeded the %d-byte limit; request a narrower result"}`, maxBytes), nil
 	}
 	return string(data), nil
 }
