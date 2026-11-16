@@ -94,7 +94,7 @@ func (c *Client) Review(ctx context.Context, system, user string, tools []Tool, 
 			return Result{}, readErr
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return Result{}, fmt.Errorf("AI endpoint returned HTTP %d", resp.StatusCode)
+			return Result{}, fmt.Errorf("AI endpoint returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
 		}
 		var result response
 		if err = json.Unmarshal(data, &result); err != nil {

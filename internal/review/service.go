@@ -77,9 +77,11 @@ func (s *Service) accept(w http.ResponseWriter, r *http.Request, body []byte) {
 	if kind == "thread" {
 		comments, err := s.gitea.ReviewComments(r.Context(), owner, repo, n)
 		if err != nil {
+			cause := s.safeError(err)
+			s.log.Error("review failed", "pr", key, "cause", cause)
 			_, _, _, notify := s.cfg.ForRepo(owner, repo)
 			if notify {
-				_ = s.gitea.FailureComment(r.Context(), owner, repo, n, "Giteye could not complete this review. Please retry the review request.")
+				_ = s.gitea.FailureComment(r.Context(), owner, repo, n, failureComment())
 			}
 			w.WriteHeader(http.StatusOK)
 			return
@@ -103,14 +105,35 @@ func (s *Service) accept(w http.ResponseWriter, r *http.Request, body []byte) {
 			if ctx.Err() != nil {
 				return
 			}
-			s.log.Error("review failed", "pr", key)
+			cause := s.safeError(err)
+			s.log.Error("review failed", "pr", key, "cause", cause)
 			_, _, _, notify := s.cfg.ForRepo(owner, repo)
 			if notify {
-				_ = s.gitea.FailureComment(ctx, owner, repo, n, "Giteye could not complete this review. Please retry the review request.")
+				_ = s.gitea.FailureComment(ctx, owner, repo, n, failureComment())
 			}
 		}
 	})
 	w.WriteHeader(http.StatusAccepted)
+}
+
+func (s *Service) safeError(err error) string {
+	if err == nil {
+		return "unknown error"
+	}
+	cause := strings.TrimSpace(err.Error())
+	for _, secret := range []string{s.cfg.Gitea.Token, s.cfg.Webhook.Secret, s.cfg.AI.APIKey, s.cfg.MCP.Token} {
+		if len(secret) >= 4 {
+			cause = strings.ReplaceAll(cause, secret, "[redacted]")
+		}
+	}
+	if cause == "" {
+		return "unknown error"
+	}
+	return cause
+}
+
+func failureComment() string {
+	return "Giteye could not complete this review. Check the service logs for the cause, fix it, then retry the review request."
 }
 
 func reviewReply(reviewID int64, actor string, comments []gitea.Comment) (gitea.Comment, bool) {

@@ -91,7 +91,8 @@ func (c *Client) do(ctx context.Context, method, endpoint string, body any, out 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("Gitea API returned HTTP %d", resp.StatusCode)
+		message, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("Gitea API returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(message)))
 	}
 	if out != nil {
 		return json.NewDecoder(io.LimitReader(resp.Body, 32<<20)).Decode(out)
@@ -121,7 +122,8 @@ func (c *Client) Diff(ctx context.Context, o, r string, n int64) (string, error)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("Gitea API returned HTTP %d", resp.StatusCode)
+		message, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return "", fmt.Errorf("Gitea API returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(message)))
 	}
 	b, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 	return string(b), err

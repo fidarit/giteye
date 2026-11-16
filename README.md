@@ -22,7 +22,7 @@ Gitea 28.4 creates reviews through `POST /api/v1/repos/{owner}/{repo}/pulls/{ind
 
 Copy `config.example.yaml` to `config.yaml` and fill in credentials. Secret values and service URLs can be overridden with environment variables; `.env.example` lists them. YAML options also include a per-repository map keyed by `owner/repo`, which can override review language, prompts, and failure notification.
 
-The default review language is Russian. `system_prompt_override` replaces the default system prompt; `system_prompt_addition` appends instructions. `notify_on_failure` defaults to `true` and posts a short PR comment on hard failure. It never includes error details or credentials. `max_tool_rounds` defaults to 6 and `max_concurrent_reviews` defaults to 4.
+The default review language is Russian. `system_prompt_override` replaces the default system prompt; `system_prompt_addition` appends instructions. `notify_on_failure` defaults to `true` and posts a short PR comment on hard failure. The detailed cause is written to the service log with configured credentials redacted. `max_tool_rounds` defaults to 6 and `max_concurrent_reviews` defaults to 4.
 
 MCP is optional. Leave `mcp.url` empty for diff and Gitea API context only. Any MCP server exposing Streamable HTTP can be used; Giteye discovers tools with `tools/list`, presents their schemas to the model, and calls selected tools by their discovered names. It has no gitea-mcp-specific tool names or assumptions. The official `gitea-mcp` v1.13.x is one possible server, not a dependency.
 
