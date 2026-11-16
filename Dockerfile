@@ -7,6 +7,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/giteye 
 
 FROM alpine:3.22
 RUN addgroup -S giteye && adduser -S -G giteye giteye && apk add --no-cache ca-certificates
+WORKDIR /app
 COPY --from=build /out/giteye /usr/local/bin/giteye
 USER giteye
 EXPOSE 8080

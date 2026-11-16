@@ -43,6 +43,19 @@ docker build -t giteye .
 docker run --rm -p 8080:8080 --env-file .env -v "$PWD/config.yaml:/config.yaml:ro" giteye -config /config.yaml
 ```
 
+## Docker Compose
+
+```sh
+cp .env.example .env
+cp config.example.yaml config.yaml
+```
+
+Fill in the Gitea URL and token, webhook secret, and AI settings in `.env`, then start the service:
+
+```sh
+docker compose up -d
+```
+
 ## Behavior
 
 - Review request delivery starts one full review. A repeated delivery ID is suppressed; a newer relevant request for that PR cancels its in-flight work. Reviews across all PRs share the configured concurrency limit.
