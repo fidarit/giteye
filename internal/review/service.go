@@ -181,7 +181,7 @@ func (s *Service) run(ctx context.Context, o, r string, n int64, kind string, e 
 	}
 	language, override, addition, _ := s.cfg.ForRepo(o, r)
 	system := prompt.Build(override, addition, language)
-	user := reviewContext(o, r, d, s.cfg.Gitea.BotUsername)
+	user := reviewContext(o, r, d, s.cfg.Gitea.BotUsername, kind != "thread")
 	var targetID int64
 	if kind == "thread" {
 		root, ok := threadRoot(e.Comment.InReplyTo, d.ReviewComments, s.cfg.Gitea.BotUsername)
@@ -290,9 +290,13 @@ func toDiffComments(in []llm.Comment) []diffvalidate.Comment {
 	}
 	return out
 }
-func reviewContext(owner, repo string, d contextData, bot string) string {
+func reviewContext(owner, repo string, d contextData, bot string, includeHistory bool) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Repository: %s/%s\nPull request: #%d %s\nURL: %s\nBase: %s (%s)\nHead: %s (%s)\nDescription:\n%s\n\nDiff:\n%s\n\nPrior reviews and discussion (use as history; do not repeat resolved findings blindly):\n", owner, repo, d.PR.Number, d.PR.Title, d.PR.HTMLURL, d.PR.Base.Ref, d.PR.Base.SHA, d.PR.Head.Ref, d.PR.Head.SHA, d.PR.Body, d.Diff)
+	fmt.Fprintf(&b, "Repository: %s/%s\nPull request: #%d %s\nURL: %s\nBase: %s (%s)\nHead: %s (%s)\nDescription:\n%s\n\nDiff:\n%s\n", owner, repo, d.PR.Number, d.PR.Title, d.PR.HTMLURL, d.PR.Base.Ref, d.PR.Base.SHA, d.PR.Head.Ref, d.PR.Head.SHA, d.PR.Body, d.Diff)
+	if !includeHistory {
+		return b.String()
+	}
+	b.WriteString("\nPrior reviews and discussion (use as history; do not repeat resolved findings blindly):\n")
 	for _, r := range d.Reviews {
 		fmt.Fprintf(&b, "Review by %s [%s]: %s\n", userName(r.User), r.State, r.Body)
 	}
