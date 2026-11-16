@@ -19,6 +19,8 @@ mcp:
   auth_header: "Authorization"
   allowed_tools: []        # explicit opt-in for tools not marked read-only by the MCP server
 
+log_api_requests: false   # log AI/MCP request metadata; prompt, tool arguments, and results are omitted
+
 notify_on_failure: true
 max_concurrent_reviews: 4
 max_tool_rounds: 6

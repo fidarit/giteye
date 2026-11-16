@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -17,6 +18,8 @@ type Config struct {
 	BaseURL, APIKey, Model string
 	MaxToolRounds          int
 	MaxToolResultBytes     int
+	LogRequests            bool
+	Logger                 *slog.Logger
 }
 
 type Comment struct {
@@ -57,6 +60,7 @@ type Function struct {
 type Client struct {
 	cfg Config
 	api *openai.Client
+	log *slog.Logger
 }
 
 func New(c Config) *Client {
@@ -72,7 +76,11 @@ func New(c Config) *Client {
 		option.WithBaseURL(strings.TrimRight(c.BaseURL, "/")),
 		option.WithHTTPClient(httpClient),
 	)
-	return &Client{cfg: c, api: &api}
+	logger := c.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &Client{cfg: c, api: &api, log: logger}
 }
 
 func (c *Client) Review(ctx context.Context, system, user string, tools []Tool, call func(context.Context, string, map[string]any) (any, error)) (Result, error) {
@@ -109,7 +117,9 @@ func (c *Client) Review(ctx context.Context, system, user string, tools []Tool, 
 			}
 		}
 
+		started := time.Now()
 		completion, err := c.api.Chat.Completions.New(ctx, params)
+		c.logAPIRequest(params, round+1, started, completion, err)
 		if err != nil {
 			return Result{Usage: usage}, fmt.Errorf("OpenAI-compatible chat completion: %w", err)
 		}
@@ -156,6 +166,37 @@ func (c *Client) Review(ctx context.Context, system, user string, tools []Tool, 
 			messages = append(messages, openai.ToolMessage(content, toolCall.ID))
 		}
 	}
+}
+
+func (c *Client) logAPIRequest(params openai.ChatCompletionNewParams, round int, started time.Time, completion *openai.ChatCompletion, err error) {
+	if !c.cfg.LogRequests {
+		return
+	}
+	requestBytes := 0
+	if encoded, encodeErr := json.Marshal(params); encodeErr == nil {
+		requestBytes = len(encoded)
+	}
+	attrs := []any{
+		"provider", "ai", "operation", "chat.completions", "model", c.cfg.Model,
+		"round", round, "request_bytes", requestBytes,
+		"duration", time.Since(started).Round(time.Millisecond),
+	}
+	if err != nil {
+		attrs = append(attrs, "status", "failed", "error_type", fmt.Sprintf("%T", err))
+	} else {
+		toolCalls := 0
+		if len(completion.Choices) > 0 {
+			toolCalls = len(completion.Choices[0].Message.ToolCalls)
+		}
+		attrs = append(attrs,
+			"status", "completed",
+			"input_tokens", completion.Usage.PromptTokens,
+			"output_tokens", completion.Usage.CompletionTokens,
+			"cached_input_tokens", completion.Usage.PromptTokensDetails.CachedTokens,
+			"tool_calls", toolCalls,
+		)
+	}
+	c.log.Info("API request", attrs...)
 }
 
 func toolContent(value any, maxBytes int) (string, error) {

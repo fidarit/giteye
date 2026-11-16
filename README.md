@@ -69,6 +69,7 @@ Giteye reads `config.yaml` from the working directory by default. If the file do
 | `mcp.token` | No | Empty | Optional token sent to the MCP server. |
 | `mcp.auth_header` | No | `Authorization` when a token is set | Header name for `mcp.token`. For `Authorization`, a token without a scheme is sent as `Bearer <token>`. |
 | `mcp.allowed_tools` | No | Empty | Exact MCP tool names explicitly allowed even when they are not marked read-only by the server. |
+| `log_api_requests` | No | `false` | Log metadata for each AI and MCP request. Prompts, diffs, tool arguments, and results are omitted. |
 | `notify_on_failure` | No | `true` | Post a generic PR comment after a hard review failure. |
 | `max_concurrent_reviews` | No | `4` | Maximum number of active reviews across all PRs. Values below 1 use the default. |
 | `max_tool_rounds` | No | `6` | Maximum number of AI rounds that may request MCP tools. Values below 1 use the default. |
@@ -119,6 +120,7 @@ These variables override the corresponding global YAML setting:
 | `MCP_TOKEN` | `mcp.token` |
 | `MCP_AUTH_HEADER` | `mcp.auth_header` |
 | `MCP_ALLOWED_TOOLS` | `mcp.allowed_tools` (comma-separated) |
+| `GITEYE_LOG_API_REQUESTS` | `log_api_requests` (`true`/`false`) |
 | `REVIEW_LANGUAGE` | `review_language` |
 
 There are no environment overrides for prompts, notification policy, concurrency, tool rounds, or per-repository settings; configure those in YAML. See [config.example.yaml](config.example.yaml) and [.env.example](.env.example) for complete examples.
@@ -138,7 +140,7 @@ Gitea webhook ──signed event──> Giteye ──PR data and diff──> Git
 - The AI endpoint receives PR content. If MCP is configured, Giteye discovers its tools and provides them to the model. Selected tool calls, their arguments, and returned results are part of the AI conversation; the MCP server may also process or forward them according to its implementation.
 - Giteye has no database or persistent review cache. Active review context exists in process memory while work runs. Delivery IDs are kept in memory and entries older than 24 hours are pruned when another review event is accepted; a process restart clears the cache.
 - Reviews and comments posted by Giteye are stored by Gitea. AI and MCP providers may retain requests or tool data under their own policies. Choose endpoints and provider settings appropriate for the code and discussion data in your repositories.
-- Logs go to standard output. They include PR identifiers, event type, duration, tool-call counts, token usage when available, and failure causes. Review diffs and prompts are not logged. Configured credentials are redacted from error messages.
+- Logs go to standard output. They include PR identifiers, event type, duration, tool-call counts, token usage when available, and failure causes. Set `log_api_requests` or `GITEYE_LOG_API_REQUESTS` to `true` to log metadata for each AI and MCP request, including duration, payload sizes, status, and available token usage. Request and response contents, prompts, diffs, tool arguments, and MCP results are not logged. Configured credentials are redacted from error messages.
 - The `limits` section controls request and context sizes, MCP discovery, and tool schemas/results. Defaults are shown above.
 
 ## MCP

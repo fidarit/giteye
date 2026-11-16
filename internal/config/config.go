@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -19,6 +20,7 @@ type Config struct {
 	Webhook              Webhook                 `yaml:"webhook"`
 	AI                   AI                      `yaml:"ai"`
 	MCP                  MCP                     `yaml:"mcp"`
+	LogAPIRequests       bool                    `yaml:"log_api_requests"`
 	NotifyOnFailure      bool                    `yaml:"notify_on_failure"`
 	MaxConcurrentReviews int                     `yaml:"max_concurrent_reviews"`
 	MaxToolRounds        int                     `yaml:"max_tool_rounds"`
@@ -159,7 +161,9 @@ func Load(path string) (Config, error) {
 			}
 		}
 	}
-	applyEnv(&c)
+	if err := applyEnv(&c); err != nil {
+		return Config{}, err
+	}
 	c = c.WithDefaults()
 	c.Gitea.URL = strings.TrimRight(c.Gitea.URL, "/")
 	c.AI.BaseURL = strings.TrimRight(c.AI.BaseURL, "/")
@@ -207,7 +211,7 @@ func Load(path string) (Config, error) {
 	return c, nil
 }
 
-func applyEnv(c *Config) {
+func applyEnv(c *Config) error {
 	values := map[string]*string{
 		"GITEYE_LISTEN_ADDR": &c.ListenAddr,
 		"GITEA_URL":          &c.Gitea.URL,
@@ -235,6 +239,14 @@ func applyEnv(c *Config) {
 			}
 		}
 	}
+	if value, ok := os.LookupEnv("GITEYE_LOG_API_REQUESTS"); ok {
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("GITEYE_LOG_API_REQUESTS must be a boolean: %w", err)
+		}
+		c.LogAPIRequests = parsed
+	}
+	return nil
 }
 
 func validateHTTPURL(name, value string) error {

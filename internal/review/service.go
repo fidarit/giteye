@@ -51,6 +51,7 @@ func NewService(c config.Config, logger *slog.Logger) (*Service, error) {
 		ai: llm.New(llm.Config{
 			BaseURL: c.AI.BaseURL, APIKey: c.AI.APIKey, Model: c.AI.Model,
 			MaxToolRounds: c.MaxToolRounds, MaxToolResultBytes: c.Limits.MCPToolResultBytes,
+			LogRequests: c.LogAPIRequests, Logger: logger,
 		}),
 		manager: NewManager(c.MaxConcurrentReviews),
 		log:     logger,
@@ -298,7 +299,10 @@ func (s *Service) discoverMCPTools(ctx context.Context) (*mcpbridge.Session, []l
 	if s.cfg.MCP.URL == "" {
 		return nil, nil, nil, nil
 	}
-	bridge := mcpbridge.Client{URL: s.cfg.MCP.URL, Token: s.cfg.MCP.Token, AuthHeader: s.cfg.MCP.AuthHeader}
+	bridge := mcpbridge.Client{
+		URL: s.cfg.MCP.URL, Token: s.cfg.MCP.Token, AuthHeader: s.cfg.MCP.AuthHeader,
+		LogRequests: s.cfg.LogAPIRequests, Logger: s.log,
+	}
 	session, err := bridge.Connect(ctx)
 	if err != nil {
 		return nil, nil, nil, err
