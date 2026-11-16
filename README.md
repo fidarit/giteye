@@ -40,8 +40,10 @@ Build and run with Docker:
 
 ```sh
 docker build -t giteye .
-docker run --rm -p 8080:8080 --env-file .env -v "$PWD/config.yaml:/config.yaml:ro" giteye -config /config.yaml
+docker run --rm -p 8080:8080 --env-file .env giteye
 ```
+
+To load optional YAML settings with `docker run`, add `-v "$PWD/config.yaml:/app/config.yaml:ro"`.
 
 ## Docker Compose
 
@@ -50,7 +52,7 @@ cp .env.example .env
 cp config.example.yaml config.yaml
 ```
 
-Fill in the Gitea URL and token, webhook secret, and AI settings in `.env`, then start the service:
+Fill in the Gitea URL and token, webhook secret, and AI settings in `.env`, then start the service. YAML configuration is optional; when `config.yaml` is present, it is loaded first and environment values override it:
 
 ```sh
 docker compose up -d

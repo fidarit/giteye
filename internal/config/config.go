@@ -51,11 +51,13 @@ func Load(path string) (Config, error) {
 	c := Config{ListenAddr: ":8080", NotifyOnFailure: true, MaxConcurrentReviews: 4, MaxToolRounds: 6, ReviewLanguage: "ru"}
 	if path != "" {
 		b, err := os.ReadFile(path)
-		if err != nil {
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return c, err
 		}
-		if err := yaml.Unmarshal(b, &c); err != nil {
-			return c, err
+		if err == nil {
+			if err := yaml.Unmarshal(b, &c); err != nil {
+				return c, err
+			}
 		}
 	}
 	set := func(key string, dst *string) {
