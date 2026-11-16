@@ -29,6 +29,18 @@ type Result struct {
 	Summary     string    `json:"summary"`
 	Comments    []Comment `json:"comments"`
 	ThreadReply *string   `json:"thread_reply"`
+	Usage       Usage     `json:"-"`
+}
+
+type Usage struct {
+	ToolCalls       int
+	ToolRounds      int
+	InputTokens     int64
+	OutputTokens    int64
+	TotalTokens     int64
+	CachedInput     int64
+	CacheWriteInput int64
+	Available       bool
 }
 
 type Tool struct {
@@ -63,6 +75,7 @@ func New(c Config) *Client {
 func (c *Client) Review(ctx context.Context, system, user string, tools []Tool, call func(context.Context, string, map[string]any) (any, error)) (Result, error) {
 	messages := []openai.ChatCompletionMessageParamUnion{openai.SystemMessage(system), openai.UserMessage(user)}
 	jsonFormat := openai.ResponseFormatJSONObjectParam{Type: "json_object"}
+	usage := Usage{}
 	for round := 0; ; round++ {
 		withTools := len(tools) > 0 && round < c.cfg.MaxToolRounds
 		params := openai.ChatCompletionNewParams{
@@ -89,19 +102,25 @@ func (c *Client) Review(ctx context.Context, system, user string, tools []Tool, 
 
 		completion, err := c.api.Chat.Completions.New(ctx, params)
 		if err != nil {
-			return Result{}, fmt.Errorf("OpenAI-compatible chat completion: %w", err)
+			return Result{Usage: usage}, fmt.Errorf("OpenAI-compatible chat completion: %w", err)
 		}
+		usage.InputTokens += completion.Usage.PromptTokens
+		usage.OutputTokens += completion.Usage.CompletionTokens
+		usage.TotalTokens += completion.Usage.TotalTokens
+		usage.CachedInput += completion.Usage.PromptTokensDetails.CachedTokens
+		usage.CacheWriteInput += completion.Usage.PromptTokensDetails.CacheWriteTokens
+		usage.Available = usage.Available || completion.Usage.TotalTokens > 0 || completion.Usage.PromptTokens > 0 || completion.Usage.CompletionTokens > 0 || completion.Usage.PromptTokensDetails.CachedTokens > 0 || completion.Usage.PromptTokensDetails.CacheWriteTokens > 0
 		if len(completion.Choices) == 0 {
-			return Result{}, errors.New("AI endpoint returned no choices")
+			return Result{Usage: usage}, errors.New("AI endpoint returned no choices")
 		}
 		message := completion.Choices[0].Message
 		if len(message.ToolCalls) > 0 && !withTools {
-			return Result{}, errors.New("AI exceeded the configured MCP tool rounds")
+			return Result{Usage: usage}, errors.New("AI exceeded the configured MCP tool rounds")
 		}
 		if len(message.ToolCalls) == 0 {
 			var result Result
 			if err := json.Unmarshal([]byte(message.Content), &result); err != nil {
-				return Result{}, fmt.Errorf("decode AI review JSON: %w", err)
+				return Result{Usage: usage}, fmt.Errorf("decode AI review JSON: %w", err)
 			}
 			if result.Event != "APPROVE" {
 				result.Event = "COMMENT"
@@ -109,14 +128,17 @@ func (c *Client) Review(ctx context.Context, system, user string, tools []Tool, 
 			if strings.TrimSpace(result.Summary) == "" {
 				result.Summary = "Review completed."
 			}
+			result.Usage = usage
 			return result, nil
 		}
 
+		usage.ToolRounds++
+		usage.ToolCalls += len(message.ToolCalls)
 		messages = append(messages, message.ToParam())
 		for _, toolCall := range message.ToolCalls {
 			var args map[string]any
 			if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &args); err != nil {
-				return Result{}, fmt.Errorf("decode MCP tool arguments: %w", err)
+				return Result{Usage: usage}, fmt.Errorf("decode MCP tool arguments: %w", err)
 			}
 			value, callErr := call(ctx, toolCall.Function.Name, args)
 			if callErr != nil {
@@ -124,7 +146,7 @@ func (c *Client) Review(ctx context.Context, system, user string, tools []Tool, 
 			}
 			content, err := toolContent(value)
 			if err != nil {
-				return Result{}, err
+				return Result{Usage: usage}, err
 			}
 			messages = append(messages, openai.ToolMessage(content, toolCall.ID))
 		}

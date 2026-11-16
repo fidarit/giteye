@@ -101,16 +101,32 @@ func (s *Service) accept(w http.ResponseWriter, r *http.Request, body []byte) {
 		}
 	}
 	s.manager.Start(context.Background(), key, delivery, func(ctx context.Context) {
-		if err := s.run(ctx, owner, repo, n, kind, e); err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			cause := s.safeError(err)
-			s.log.Error("review failed", "pr", key, "cause", cause)
-			_, _, _, notify := s.cfg.ForRepo(owner, repo)
-			if notify {
-				_ = s.gitea.FailureComment(ctx, owner, repo, n, failureComment())
-			}
+		started := time.Now()
+		s.log.Info("review started", "pr", key, "kind", kind, "model", s.cfg.AI.Model)
+		usage, err := s.run(ctx, owner, repo, n, kind, e)
+		attrs := []any{"pr", key, "kind", kind, "model", s.cfg.AI.Model, "duration", time.Since(started).Round(time.Millisecond), "tool_calls", usage.ToolCalls, "tool_rounds", usage.ToolRounds, "usage_available", usage.Available}
+		if usage.Available {
+			attrs = append(attrs,
+				"input_tokens", usage.InputTokens,
+				"output_tokens", usage.OutputTokens,
+				"total_tokens", usage.TotalTokens,
+				"cached_input_tokens", usage.CachedInput,
+				"cache_write_tokens", usage.CacheWriteInput,
+			)
+		}
+		if err == nil {
+			s.log.Info("review finished", append(attrs, "status", "completed")...)
+			return
+		}
+		if ctx.Err() != nil {
+			s.log.Info("review finished", append(attrs, "status", "canceled")...)
+			return
+		}
+		cause := s.safeError(err)
+		s.log.Error("review finished", append(attrs, "status", "failed", "cause", cause)...)
+		_, _, _, notify := s.cfg.ForRepo(owner, repo)
+		if notify {
+			_ = s.gitea.FailureComment(ctx, owner, repo, n, failureComment())
 		}
 	})
 	w.WriteHeader(http.StatusAccepted)
@@ -174,10 +190,10 @@ func (s *Service) load(ctx context.Context, o, r string, n int64) (contextData, 
 	return d, nil
 }
 
-func (s *Service) run(ctx context.Context, o, r string, n int64, kind string, e webhook.Event) error {
+func (s *Service) run(ctx context.Context, o, r string, n int64, kind string, e webhook.Event) (llm.Usage, error) {
 	d, err := s.load(ctx, o, r, n)
 	if err != nil {
-		return err
+		return llm.Usage{}, err
 	}
 	language, override, addition, _ := s.cfg.ForRepo(o, r)
 	system := prompt.Build(override, addition, language)
@@ -186,7 +202,7 @@ func (s *Service) run(ctx context.Context, o, r string, n int64, kind string, e 
 	if kind == "thread" {
 		root, ok := threadRoot(e.Comment.InReplyTo, d.ReviewComments, s.cfg.Gitea.BotUsername)
 		if !ok {
-			return nil
+			return llm.Usage{}, nil
 		}
 		targetID = root.ID
 		user += "\n\nActive bot thread:\n" + threadContext(root, e.Comment, d.ReviewComments)
@@ -237,27 +253,27 @@ func (s *Service) run(ctx context.Context, o, r string, n int64, kind string, e 
 	}
 	result, err := s.ai.Review(ctx, system, user, tools, call)
 	if err != nil {
-		return err
+		return result.Usage, err
 	}
 	if kind == "thread" {
 		comments := diffvalidate.GiteaComments(d.Diff, toDiffComments(result.Comments))
 		if len(comments) > 0 {
 			if err := s.gitea.CreateReview(ctx, o, r, n, d.PR.Head.SHA, "COMMENT", result.Summary, comments); err != nil {
-				return err
+				return result.Usage, err
 			}
 		}
 		threadReply := result.Summary
 		if result.ThreadReply != nil && strings.TrimSpace(*result.ThreadReply) != "" {
 			threadReply = *result.ThreadReply
 		}
-		return s.gitea.Reply(ctx, o, r, n, targetID, threadReply)
+		return result.Usage, s.gitea.Reply(ctx, o, r, n, targetID, threadReply)
 	}
 	comments := diffvalidate.GiteaComments(d.Diff, toDiffComments(result.Comments))
 	event := "COMMENT"
 	if result.Event == "APPROVE" && len(comments) == 0 {
 		event = "APPROVED"
 	}
-	return s.gitea.CreateReview(ctx, o, r, n, d.PR.Head.SHA, event, result.Summary, comments)
+	return result.Usage, s.gitea.CreateReview(ctx, o, r, n, d.PR.Head.SHA, event, result.Summary, comments)
 }
 
 func openAIToolName(name string, used map[string]string) string {
