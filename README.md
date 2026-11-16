@@ -1,73 +1,154 @@
 # Giteye
 
-Giteye is a self-hosted AI reviewer for Gitea. It runs a full review only when its account is explicitly requested as a pull request reviewer. A reply to a bot review thread can trigger a contextual response and a check against the current diff. Pushes and ordinary pull request open/sync events do not start reviews.
+Giteye is a self-hosted AI reviewer for Gitea. It reviews a pull request only after its bot account is requested as a reviewer. It can also respond when someone replies to a comment in an active Giteye review thread. Pushes and pull request open/sync events do not start reviews.
 
-## Gitea compatibility and setup
+## Requirements
 
-Minimum supported Gitea version: **1.27.0**. Giteye uses the review-comment reply API, which was added in that release ([release notes](https://blog.gitea.com/release-of-1.27.0/)).
+- Gitea **1.27.0 or newer**. Giteye uses the API endpoint for replying to pull request review comments, added in [Gitea 1.27.0](https://blog.gitea.com/release-of-1.27.0/).
+- A reachable Gitea instance and a bot account with repository read access and permission to create pull reviews and issue comments.
+- An OpenAI-compatible Chat Completions endpoint, API key, and model.
+- Docker Compose, or Go **1.27** to build and run from source.
 
-Create a **Gitea** webhook at repository settings (`/:owner/:repo/settings/hooks`), or install an organization or system webhook to cover multiple repositories. Use:
-
-- Target URL: `https://giteye.example.com/webhook`
-- HTTP method: `POST`
-- Content type: `application/json`
-- Secret: the same value as `webhook.secret` / `WEBHOOK_SECRET`
-- Trigger On: **Custom Events**, selecting **Pull Request Review Request**, **Pull Request Comments**, and **Pull Request Review Comments**
-
-The corresponding Gitea event types are `pull_request_review_request`, `pull_request_comment`, and `pull_request_review_comment`. The review request event's `review_requested` action and `requested_reviewer` identify the targeted reviewer. `pull_request_sync` is deliberately not enabled. Gitea signs the raw body with HMAC-SHA256 in `X-Gitea-Signature`; Giteye requires and verifies that header before decoding the payload.
-
-Create a dedicated bot account and request it as a reviewer on PRs. Give it repository read access and permission to create pull reviews and issue comments. For a classic access token, the minimal scopes are `read:repository`, `write:repository`, `read:issue`, and `write:issue`; the bot account must also have access to each covered repository. Gitea uses `Authorization: token <token>` for API calls.
-
-Giteye creates reviews through `POST /api/v1/repos/{owner}/{repo}/pulls/{index}/reviews`. It maps an absolute new-file line from model output to its unified-diff position and sends that value as `new_position`; comments with no matching current diff line are dropped. Model `APPROVE` maps to Gitea's API event `APPROVED`, while all other formal reviews use `COMMENT`.
-
-## Configuration
-
-Copy `config.example.yaml` to `config.yaml` and fill in credentials. Secret values and service URLs can be overridden with environment variables; `.env.example` lists them. YAML options also include a per-repository map keyed by `owner/repo`, which can override review language, prompts, and failure notification.
-
-The default review language is Russian. `system_prompt_override` replaces the default system prompt; `system_prompt_addition` appends instructions. `notify_on_failure` defaults to `true` and posts a short PR comment on hard failure. The detailed cause is written to the service log with configured credentials redacted. `max_tool_rounds` defaults to 6 and `max_concurrent_reviews` defaults to 4.
-
-MCP is optional. Leave `mcp.url` empty for diff and Gitea API context only. Any MCP server exposing Streamable HTTP can be used; Giteye discovers tools with `tools/list`, presents their schemas to the model, and calls selected tools by their discovered names. It has no gitea-mcp-specific tool names or assumptions. The official `gitea-mcp` v1.13.x is one possible server, not a dependency.
-
-When `mcp.token` is set, Giteye sends it as a Bearer token in the `Authorization` header by default. Set `mcp.auth_header` to another header name to send the token value there unchanged.
-
-## Run
-
-```sh
-go run ./cmd/giteye -config config.yaml
-```
-
-`GET /healthz` is a liveness endpoint. `POST /webhook` accepts signed Gitea JSON webhooks.
-
-Build and run with Docker:
-
-```sh
-docker build -t giteye .
-docker run --rm -p 8080:8080 --env-file .env giteye
-```
-
-To load optional YAML settings with `docker run`, add `-v "$PWD/config.yaml:/app/config.yaml:ro"`.
-
-## Docker Compose
+## Quick start with Docker Compose
 
 ```sh
 cp .env.example .env
 cp config.example.yaml config.yaml
 ```
 
-Fill in the Gitea URL and token, webhook secret, and AI settings in `.env`, then start the service. YAML configuration is optional; when `config.yaml` is present, it is loaded first and environment values override it:
+Set `GITEA_URL`, `GITEA_TOKEN`, `GITEA_BOT_USERNAME`, `WEBHOOK_SECRET`, `AI_BASE_URL`, `AI_API_KEY`, and `AI_MODEL` in `.env`. Then run:
 
 ```sh
 docker compose up -d
+docker compose logs -f giteye
 ```
 
-## Behavior
+Compose mounts `config.yaml` into the container. To run with environment variables only, remove the `config.yaml` volume entry from `compose.yaml`. At the application level, the YAML file is optional.
 
-- Review request delivery starts one full review. A repeated delivery ID is suppressed; a newer relevant request for that PR cancels its in-flight work. Reviews across all PRs share the configured concurrency limit.
-- A push alone is ignored. A subsequent explicit reviewer request starts a fresh full review, with earlier bot findings and PR discussion included in context.
-- Replies are handled only when the parent chain reaches a comment written by Giteye. The model sees the active thread, PR metadata, and current diff. It can close politely, explain a finding, or re-check changed code.
-- Inline comments are validated independently, so a stale or invalid model line cannot reject the rest of the review. When inline comments exist, the model can omit a separate summary if it would only repeat them.
-- MCP connection or discovery failures are logged as warnings and the review continues without tools.
-- Console logs mark review start and completion, including duration, tool call counts, and token usage when the AI provider returns it. Cached input counts are included when the provider reports them; monetary cost is not estimated.
+The service listens on port `8080` by default. Configure Gitea to send webhooks to `https://<your-host>/webhook`; `GET /healthz` is the liveness endpoint.
+
+## Gitea setup
+
+Create a Gitea webhook at repository settings (`/:owner/:repo/settings/hooks`), or use an organization or system webhook to cover multiple repositories:
+
+- Target URL: `https://<your-host>/webhook`
+- HTTP method: `POST`
+- Content type: `application/json`
+- Secret: the value of `WEBHOOK_SECRET` or `webhook.secret`
+- Events: **Pull Request Review Request**, **Pull Request Comments**, and **Pull Request Review Comments**
+
+The corresponding event types are `pull_request_review_request`, `pull_request_comment`, and `pull_request_review_comment`. The first event starts a review only when `action` is `review_requested` and the requested reviewer is the configured bot. `pull_request_sync` is not needed. Gitea signs the raw request body with HMAC-SHA256; Giteye verifies `X-Gitea-Signature` before decoding it.
+
+Create a dedicated bot account and request it as a reviewer on pull requests. For a classic access token, the required scopes are `read:repository`, `write:repository`, `read:issue`, and `write:issue`. The bot must also have access to each repository. Giteye reads pull request metadata, diff, reviews, and discussion comments through the Gitea API. It posts formal reviews, inline comments, thread replies, and—when enabled—a short failure comment.
+
+## Review behavior
+
+- A reviewer request addressed to the bot starts a full review. A re-request starts another review with prior findings and discussion in context. Opening or synchronizing a pull request alone does not trigger a review.
+- A comment triggers a response only when its parent chain reaches a Giteye comment. The model sees that thread and the current diff; it can acknowledge an accepted finding, explain a disputed one, or re-check changed code.
+- Duplicate webhook deliveries are suppressed in memory. A newer relevant event for the same PR cancels its active review. `max_concurrent_reviews` limits work across all PRs.
+- Inline comments are posted only when their file and new-side line map to the current diff. Invalid comments are dropped. If valid inline comments exist, the model decides whether a separate summary adds useful information.
+- `notify_on_failure` defaults to `true`; it controls the generic PR note posted after a hard failure. The detailed cause is written to the service log.
+
+## Configuration
+
+Giteye reads `config.yaml` from the working directory by default. If the file does not exist, it starts from defaults and environment variables. If present, YAML is loaded first and supported environment variables override it. Invalid YAML and unknown YAML keys are fatal errors. The webhook secret and the Gitea/AI connection settings are required.
+
+### Settings
+
+| YAML key | Required | Default | Purpose |
+| --- | --- | --- | --- |
+| `listen_addr` | No | `:8080` | HTTP listen address. |
+| `gitea.url` | Yes | — | Gitea base URL, including any URL prefix. |
+| `gitea.token` | Yes | — | Bot access token. |
+| `gitea.bot_username` | Yes | — | Username used to identify review requests and bot comments. |
+| `webhook.secret` | Yes | — | Secret used to verify webhook signatures. |
+| `ai.base_url` | Yes | — | OpenAI-compatible API base URL, such as `https://api.openai.com/v1`. |
+| `ai.api_key` | Yes | — | API key for the configured AI endpoint. |
+| `ai.model` | Yes | — | Model name sent to the Chat Completions API. |
+| `mcp.url` | No | Empty (disabled) | Streamable HTTP URL for an optional MCP server. |
+| `mcp.token` | No | Empty | Optional token sent to the MCP server. |
+| `mcp.auth_header` | No | `Authorization` when a token is set | Header name for `mcp.token`. For `Authorization`, a token without a scheme is sent as `Bearer <token>`. |
+| `notify_on_failure` | No | `true` | Post a generic PR comment after a hard review failure. |
+| `max_concurrent_reviews` | No | `4` | Maximum number of active reviews across all PRs. Values below 1 use the default. |
+| `max_tool_rounds` | No | `6` | Maximum number of AI rounds that may request MCP tools. Values below 1 use the default. |
+| `review_language` | No | `ru` | Language for review output. |
+| `system_prompt_override` | No | Empty | Replace the complete default system prompt. |
+| `system_prompt_addition` | No | Empty | Append instructions after the selected system prompt. |
+| `repositories` | No | Empty | Per-repository settings keyed by `owner/repo`. |
+
+Per-repository entries support `review_language`, `system_prompt_override`, `system_prompt_addition`, and `notify_on_failure`. A repository value overrides the corresponding global setting; omitted values inherit it. Example:
+
+```yaml
+repositories:
+  example/project:
+    review_language: en
+    system_prompt_addition: "Prefer concise comments."
+    notify_on_failure: false
+```
+
+### Environment variables
+
+These variables override the corresponding global YAML setting:
+
+| Variable | YAML key |
+| --- | --- |
+| `GITEYE_LISTEN_ADDR` | `listen_addr` |
+| `GITEA_URL` | `gitea.url` |
+| `GITEA_TOKEN` | `gitea.token` |
+| `GITEA_BOT_USERNAME` | `gitea.bot_username` |
+| `WEBHOOK_SECRET` | `webhook.secret` |
+| `AI_BASE_URL` | `ai.base_url` |
+| `AI_API_KEY` | `ai.api_key` |
+| `AI_MODEL` | `ai.model` |
+| `MCP_URL` | `mcp.url` |
+| `MCP_TOKEN` | `mcp.token` |
+| `MCP_AUTH_HEADER` | `mcp.auth_header` |
+| `REVIEW_LANGUAGE` | `review_language` |
+
+There are no environment overrides for prompts, notification policy, concurrency, tool rounds, or per-repository settings; configure those in YAML. See [config.example.yaml](config.example.yaml) and [.env.example](.env.example) for complete examples.
+
+## Data flow and storage
+
+```text
+Gitea webhook ──signed event──> Giteye ──PR data and diff──> Gitea API
+                                   │
+                                   ├──prompt, diff, history/thread──> configured AI endpoint
+                                   ├──discovered tool calls/results──> optional MCP server
+                                   └──review, replies, failure note──> Gitea API
+```
+
+- Giteye accepts the webhook body in memory, verifies its signature, and ignores unrelated events. It does not store webhook payloads or clone repositories.
+- For a full review, Giteye fetches PR metadata, the current diff, prior reviews, inline review comments, and PR discussion. It sends that context with the system prompt to the configured AI endpoint. For a thread reply, it sends the current diff, PR metadata, and active thread.
+- The AI endpoint receives PR content. If MCP is configured, Giteye discovers its tools and provides them to the model. Selected tool calls, their arguments, and returned results are part of the AI conversation; the MCP server may also process or forward them according to its implementation.
+- Giteye has no database or persistent review cache. Active review context exists in process memory while work runs. Delivery IDs are kept in memory and entries older than 24 hours are pruned when another review event is accepted; a process restart clears the cache.
+- Reviews and comments posted by Giteye are stored by Gitea. AI and MCP providers may retain requests or tool data under their own policies. Choose endpoints and provider settings appropriate for the code and discussion data in your repositories.
+- Logs go to standard output. They include PR identifiers, event type, duration, tool-call counts, token usage when available, and failure causes. Review diffs and prompts are not logged. Configured credentials are redacted from error messages.
+
+## MCP
+
+MCP is optional. An empty `mcp.url` disables it; reviews then use webhook and Gitea API context only. When enabled, Giteye connects over Streamable HTTP, discovers tools with `tools/list`, maps their schemas to OpenAI-compatible tools, and calls selected tools by their discovered names. Tool names and schemas are not hardcoded. MCP connection or discovery failures are logged and the review continues without tools.
+
+## Run from source
+
+```sh
+go run ./cmd/giteye
+```
+
+The `-config` flag can select a YAML file; it defaults to `config.yaml` and is optional if all required settings are supplied through environment variables.
+
+## Docker
+
+```sh
+docker build -t giteye .
+docker run --rm -p 8080:8080 --env-file .env giteye
+```
+
+To provide YAML configuration to the container, mount it at `/app/config.yaml`:
+
+```sh
+docker run --rm -p 8080:8080 --env-file .env \
+  -v "$PWD/config.yaml:/app/config.yaml:ro" giteye
+```
 
 ## Development
 
@@ -75,3 +156,7 @@ docker compose up -d
 go test ./...
 go build ./cmd/giteye
 ```
+
+## License
+
+Giteye is licensed under the [MIT License](LICENSE).
