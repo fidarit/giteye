@@ -80,7 +80,8 @@ func (c *Client) Review(ctx context.Context, system, user string, tools []Tool, 
 	jsonFormat := openai.ResponseFormatJSONObjectParam{Type: "json_object"}
 	usage := Usage{}
 	for round := 0; ; round++ {
-		withTools := len(tools) > 0 && round < c.cfg.MaxToolRounds
+		withTools := len(tools) > 0
+		canCallTools := withTools && round < c.cfg.MaxToolRounds
 		params := openai.ChatCompletionNewParams{
 			Messages:       messages,
 			Model:          openai.ChatModel(c.cfg.Model),
@@ -101,6 +102,11 @@ func (c *Client) Review(ctx context.Context, system, user string, tools []Tool, 
 					Parameters:  schema,
 				}))
 			}
+			if !canCallTools {
+				// Keep tool definitions stable across rounds so providers can reuse the
+				// cached prompt, while forcing the final response to contain no calls.
+				params.ToolChoice = openai.ChatCompletionToolChoiceOptionUnionParam{OfAuto: openai.String("none")}
+			}
 		}
 
 		completion, err := c.api.Chat.Completions.New(ctx, params)
@@ -116,7 +122,7 @@ func (c *Client) Review(ctx context.Context, system, user string, tools []Tool, 
 			return Result{Usage: usage}, errors.New("AI endpoint returned no choices")
 		}
 		message := completion.Choices[0].Message
-		if len(message.ToolCalls) > 0 && !withTools {
+		if len(message.ToolCalls) > 0 && !canCallTools {
 			return Result{Usage: usage}, errors.New("AI exceeded the configured MCP tool rounds")
 		}
 		if len(message.ToolCalls) == 0 {
