@@ -2,7 +2,9 @@
 
 Giteye is a self-hosted AI reviewer for Gitea. It runs a full review only when its account is explicitly requested as a pull request reviewer. A reply to a bot review thread can trigger a contextual response and a check against the current diff. Pushes and ordinary pull request open/sync events do not start reviews.
 
-## Gitea 28.4 setup
+## Gitea compatibility and setup
+
+Minimum supported Gitea version: **1.27.0**. Giteye uses the review-comment reply API, which was added in that release ([release notes](https://blog.gitea.com/release-of-1.27.0/)).
 
 Create a **Gitea** webhook at repository settings (`/:owner/:repo/settings/hooks`), or install an organization or system webhook to cover multiple repositories. Use:
 
@@ -16,7 +18,7 @@ The corresponding Gitea event types are `pull_request_review_request`, `pull_req
 
 Create a dedicated bot account and request it as a reviewer on PRs. Give it repository read access and permission to create pull reviews and issue comments. For a classic access token, the minimal scopes are `read:repository`, `write:repository`, `read:issue`, and `write:issue`; the bot account must also have access to each covered repository. Gitea uses `Authorization: token <token>` for API calls.
 
-Gitea 28.4 creates reviews through `POST /api/v1/repos/{owner}/{repo}/pulls/{index}/reviews`. Giteye maps an absolute new-file line from model output to its unified-diff position and sends that value as `new_position`; comments with no matching current diff line are dropped. Model `APPROVE` maps to Gitea's API event `APPROVED`, while all other formal reviews use `COMMENT`.
+Giteye creates reviews through `POST /api/v1/repos/{owner}/{repo}/pulls/{index}/reviews`. It maps an absolute new-file line from model output to its unified-diff position and sends that value as `new_position`; comments with no matching current diff line are dropped. Model `APPROVE` maps to Gitea's API event `APPROVED`, while all other formal reviews use `COMMENT`.
 
 ## Configuration
 
@@ -62,9 +64,10 @@ docker compose up -d
 
 - Review request delivery starts one full review. A repeated delivery ID is suppressed; a newer relevant request for that PR cancels its in-flight work. Reviews across all PRs share the configured concurrency limit.
 - A push alone is ignored. A subsequent explicit reviewer request starts a fresh full review, with earlier bot findings and PR discussion included in context.
-- Replies are handled only when the parent chain reaches a comment written by Giteye. The model sees that thread, prior discussion, PR metadata, and the current diff. It can close politely, explain a finding, or re-check changed code.
+- Replies are handled only when the parent chain reaches a comment written by Giteye. The model sees the active thread, PR metadata, and current diff. It can close politely, explain a finding, or re-check changed code.
 - Inline comments are validated independently, so a stale or invalid model line cannot reject the rest of the review.
 - MCP connection or discovery failures are logged as warnings and the review continues without tools.
+- Console logs mark review start and completion, including duration, tool call counts, and token usage when the AI provider returns it. Cached input counts are included when the provider reports them; monetary cost is not estimated.
 
 ## Development
 

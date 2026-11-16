@@ -2,7 +2,12 @@ package gitea
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -10,11 +15,10 @@ import (
 )
 
 type Client struct {
-	BaseURL string
-	Token   string
 	api     *sdk.Client
+	baseURL string
+	token   string
 	http    *http.Client
-	err     error
 }
 
 type User struct {
@@ -52,6 +56,13 @@ type Comment struct {
 	CreatedAt string `json:"created_at"`
 }
 
+// InlineComment is a validated Gitea review comment with a unified-diff position.
+type InlineComment struct {
+	Path     string
+	Body     string
+	Position int
+}
+
 type Review struct {
 	ID          int64  `json:"id"`
 	Body        string `json:"body"`
@@ -60,19 +71,27 @@ type Review struct {
 	SubmittedAt string `json:"submitted_at"`
 }
 
-func New(base, token string) *Client {
-	c := &Client{BaseURL: strings.TrimRight(base, "/"), Token: token, http: &http.Client{Timeout: 30 * time.Second}}
-	c.api, c.err = sdk.NewClient(c.BaseURL, sdk.SetToken(token), sdk.SetHTTPClient(c.http), sdk.SetGiteaVersion("1.28.4"))
-	return c
+type ReviewEvent string
+
+const (
+	ReviewEventComment ReviewEvent = "COMMENT"
+	ReviewEventApprove ReviewEvent = "APPROVED"
+)
+
+func New(baseURL, token string) (*Client, error) {
+	httpClient := &http.Client{Timeout: 30 * time.Second}
+	baseURL = strings.TrimRight(baseURL, "/")
+	api, err := sdk.NewClient(baseURL, sdk.SetToken(token), sdk.SetHTTPClient(httpClient))
+	if err != nil {
+		return nil, fmt.Errorf("initialize Gitea API client: %w", err)
+	}
+	return &Client{api: api, baseURL: baseURL, token: token, http: httpClient}, nil
 }
 
 func (c *Client) Pull(ctx context.Context, owner, repo string, number int64) (PullRequest, error) {
-	if c.err != nil {
-		return PullRequest{}, c.err
-	}
 	p, _, err := c.api.PullRequests.GetPullRequest(ctx, owner, repo, number)
 	if err != nil {
-		return PullRequest{}, err
+		return PullRequest{}, fmt.Errorf("get pull request %s/%s#%d: %w", owner, repo, number, err)
 	}
 	out := PullRequest{Number: p.Index, Title: p.Title, Body: p.Body, State: string(p.State), HTMLURL: p.HTMLURL}
 	if p.Base != nil {
@@ -90,22 +109,19 @@ func (c *Client) Pull(ctx context.Context, owner, repo string, number int64) (Pu
 }
 
 func (c *Client) Diff(ctx context.Context, owner, repo string, number int64) (string, error) {
-	if c.err != nil {
-		return "", c.err
-	}
 	diff, _, err := c.api.PullRequests.GetPullRequestDiff(ctx, owner, repo, number, sdk.PullRequestDiffOptions{})
-	return string(diff), err
+	if err != nil {
+		return "", fmt.Errorf("get pull request diff %s/%s#%d: %w", owner, repo, number, err)
+	}
+	return string(diff), nil
 }
 
 func (c *Client) Reviews(ctx context.Context, owner, repo string, number int64) ([]Review, error) {
-	if c.err != nil {
-		return nil, c.err
-	}
 	var out []Review
 	for page := 1; ; page++ {
 		items, _, err := c.api.PullRequests.ListPullReviews(ctx, owner, repo, number, sdk.ListPullReviewsOptions{ListOptions: sdk.ListOptions{Page: page, PageSize: 50}})
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("list reviews for %s/%s#%d: %w", owner, repo, number, err)
 		}
 		for _, item := range items {
 			if item == nil {
@@ -124,14 +140,11 @@ func (c *Client) Reviews(ctx context.Context, owner, repo string, number int64) 
 }
 
 func (c *Client) IssueComments(ctx context.Context, owner, repo string, number int64) ([]Comment, error) {
-	if c.err != nil {
-		return nil, c.err
-	}
 	var out []Comment
 	for page := 1; ; page++ {
 		items, _, err := c.api.Issues.ListIssueComments(ctx, owner, repo, number, sdk.ListIssueCommentOptions{ListOptions: sdk.ListOptions{Page: page, PageSize: 50}})
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("list discussion comments for %s/%s#%d: %w", owner, repo, number, err)
 		}
 		for _, item := range items {
 			if item == nil {
@@ -149,77 +162,82 @@ func (c *Client) IssueComments(ctx context.Context, owner, repo string, number i
 	}
 }
 
-func (c *Client) ReviewComments(ctx context.Context, owner, repo string, number int64) ([]Comment, error) {
-	if c.err != nil {
-		return nil, c.err
-	}
+func (c *Client) ReviewComments(ctx context.Context, owner, repo string, number int64, reviews []Review) ([]Comment, error) {
 	// Gitea lists inline comments under each review:
 	// GET /repos/{owner}/{repo}/pulls/{index}/reviews/{id}/comments.
+	// Read the response locally because the SDK comment model omits in_reply_to.
+	var out []Comment
+	for _, review := range reviews {
+		items, err := c.listReviewComments(ctx, owner, repo, number, review.ID)
+		if err != nil {
+			return nil, fmt.Errorf("list inline comments for review %d on %s/%s#%d: %w", review.ID, owner, repo, number, err)
+		}
+		out = append(out, items...)
+	}
+	return out, nil
+}
+
+func (c *Client) listReviewComments(ctx context.Context, owner, repo string, number, reviewID int64) ([]Comment, error) {
+	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/pulls/%d/reviews/%d/comments", c.baseURL, url.PathEscape(owner), url.PathEscape(repo), number, reviewID)
 	var out []Comment
 	for page := 1; ; page++ {
-		reviews, _, err := c.api.PullRequests.ListPullReviews(ctx, owner, repo, number, sdk.ListPullReviewsOptions{ListOptions: sdk.ListOptions{Page: page, PageSize: 50}})
+		reqURL := endpoint + "?limit=50&page=" + strconv.Itoa(page)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 		if err != nil {
 			return nil, err
 		}
-		for _, review := range reviews {
-			if review == nil {
-				continue
-			}
-			items, _, err := c.api.PullRequests.ListPullReviewComments(ctx, owner, repo, number, review.ID)
-			if err != nil {
-				return nil, err
-			}
-			for _, item := range items {
-				if item == nil {
-					continue
-				}
-				comment := Comment{
-					ID: item.ID, Body: item.Body, ReviewID: item.ReviewID,
-					Path: item.Path, Position: int(item.LineNum),
-					HTMLURL: item.HTMLURL, CreatedAt: item.Created.Format(time.RFC3339Nano),
-				}
-				if item.Reviewer != nil {
-					comment.User = fromSDKUser(item.Reviewer)
-				}
-				out = append(out, comment)
-			}
+		req.Header.Set("Authorization", "token "+c.token)
+		req.Header.Set("Accept", "application/json")
+		resp, err := c.http.Do(req)
+		if err != nil {
+			return nil, err
 		}
-		if len(reviews) < 50 {
+		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+			resp.Body.Close()
+			return nil, fmt.Errorf("Gitea API returned HTTP %d", resp.StatusCode)
+		}
+		var comments []Comment
+		decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 32<<20)).Decode(&comments)
+		resp.Body.Close()
+		if decodeErr != nil {
+			return nil, fmt.Errorf("decode Gitea review comments: %w", decodeErr)
+		}
+		out = append(out, comments...)
+		if len(comments) < 50 {
 			return out, nil
 		}
 	}
 }
 
-func (c *Client) CreateReview(ctx context.Context, owner, repo string, number int64, commit, event, body string, comments []map[string]any) error {
-	if c.err != nil {
-		return c.err
+func (c *Client) CreateReview(ctx context.Context, owner, repo string, number int64, commit string, event ReviewEvent, body string, comments []InlineComment) error {
+	if event != ReviewEventComment && event != ReviewEventApprove {
+		return fmt.Errorf("unsupported Gitea review event %q", event)
 	}
 	apiComments := make([]sdk.CreatePullReviewComment, 0, len(comments))
 	for _, comment := range comments {
-		path, _ := comment["path"].(string)
-		text, _ := comment["body"].(string)
-		position, _ := comment["new_position"].(int)
-		oldPosition, _ := comment["old_position"].(int)
-		apiComments = append(apiComments, sdk.CreatePullReviewComment{Path: path, Body: text, NewLineNum: int64(position), OldLineNum: int64(oldPosition)})
+		apiComments = append(apiComments, sdk.CreatePullReviewComment{Path: comment.Path, Body: comment.Body, NewLineNum: int64(comment.Position)})
 	}
 	_, _, err := c.api.PullRequests.CreatePullReview(ctx, owner, repo, number, sdk.CreatePullReviewOptions{CommitID: commit, State: sdk.ReviewStateType(event), Body: body, Comments: apiComments})
-	return err
+	if err != nil {
+		return fmt.Errorf("create review for %s/%s#%d: %w", owner, repo, number, err)
+	}
+	return nil
 }
 
 func (c *Client) Reply(ctx context.Context, owner, repo string, number, commentID int64, body string) error {
-	if c.err != nil {
-		return c.err
-	}
 	_, _, err := c.api.PullRequests.CreatePullReviewCommentReply(ctx, owner, repo, number, commentID, sdk.CreatePullReviewCommentReplyOptions{Body: body})
-	return err
+	if err != nil {
+		return fmt.Errorf("reply to review comment %d on %s/%s#%d: %w", commentID, owner, repo, number, err)
+	}
+	return nil
 }
 
 func (c *Client) FailureComment(ctx context.Context, owner, repo string, number int64, body string) error {
-	if c.err != nil {
-		return c.err
-	}
 	_, _, err := c.api.Issues.CreateIssueComment(ctx, owner, repo, number, sdk.CreateIssueCommentOption{Body: body})
-	return err
+	if err != nil {
+		return fmt.Errorf("post failure comment on %s/%s#%d: %w", owner, repo, number, err)
+	}
+	return nil
 }
 
 func fromSDKUser(user *sdk.User) User {

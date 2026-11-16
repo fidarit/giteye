@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"strconv"
 	"strings"
+
+	"giteye/internal/gitea"
 )
 
 type Comment struct {
@@ -18,7 +20,7 @@ type Comment struct {
 func Positions(diff string) map[string]map[int]int {
 	result := map[string]map[int]int{}
 	s := bufio.NewScanner(strings.NewReader(diff))
-	s.Buffer(make([]byte, 4096), 4*1024*1024)
+	s.Buffer(make([]byte, 4096), len(diff)+1)
 	path, newLine, pos, inHunk := "", 0, 0, false
 	for s.Scan() {
 		line := s.Text()
@@ -42,7 +44,12 @@ func Positions(diff string) map[string]map[int]int {
 				inHunk = false
 				continue
 			}
-			part := strings.Fields(line[i+2:])[0]
+			fields := strings.Fields(line[i+2:])
+			if len(fields) == 0 {
+				inHunk = false
+				continue
+			}
+			part := fields[0]
 			part = strings.SplitN(part, ",", 2)[0]
 			parsedLine, err := strconv.Atoi(part)
 			if err != nil {
@@ -94,9 +101,9 @@ func Validate(diff string, comments []Comment) []Comment {
 	return out
 }
 
-func GiteaComments(diff string, comments []Comment) []map[string]any {
+func GiteaComments(diff string, comments []Comment) []gitea.InlineComment {
 	positions := Positions(diff)
-	out := make([]map[string]any, 0, len(comments))
+	out := make([]gitea.InlineComment, 0, len(comments))
 	for _, c := range comments {
 		if c.Path == "" || c.Line < 1 || strings.TrimSpace(c.Body) == "" {
 			continue
@@ -105,7 +112,7 @@ func GiteaComments(diff string, comments []Comment) []map[string]any {
 		if !ok {
 			continue
 		}
-		out = append(out, map[string]any{"path": c.Path, "body": c.Body, "new_position": p, "old_position": 0})
+		out = append(out, gitea.InlineComment{Path: c.Path, Body: c.Body, Position: p})
 	}
 	return out
 }

@@ -21,12 +21,12 @@ index 000..111 100644
 		t.Fatalf("unexpected validated comments: %#v", got)
 	}
 	positions := GiteaComments(diff, got)
-	if len(positions) != 1 || positions[0]["new_position"] != 3 {
+	if len(positions) != 1 || positions[0].Position != 3 {
 		t.Fatalf("unexpected Gitea position: %#v", positions)
 	}
 	// The second hunk continues the diff position count rather than resetting it.
 	all := GiteaComments(diff, []Comment{{Path: "a.go", Line: 21, Body: "changed"}})
-	if len(all) != 1 || all[0]["new_position"] != 6 {
+	if len(all) != 1 || all[0].Position != 6 {
 		t.Fatalf("unexpected later hunk position: %#v", all)
 	}
 }

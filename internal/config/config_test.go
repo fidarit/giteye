@@ -28,9 +28,9 @@ func TestLoadEnvironmentAndRepoOverrides(t *testing.T) {
 	if !c.NotifyOnFailure {
 		t.Fatal("global failure notification should default to true")
 	}
-	language, _, _, notify := c.ForRepo("org", "repo")
-	if language != "en" || notify {
-		t.Fatalf("repository override not applied: language=%q notify=%v", language, notify)
+	settings := c.ForRepo("org", "repo")
+	if settings.Language != "en" || settings.NotifyOnFailure {
+		t.Fatalf("repository override not applied: language=%q notify=%v", settings.Language, settings.NotifyOnFailure)
 	}
 	if c.MaxToolRounds != 6 || c.MaxConcurrentReviews != 4 {
 		t.Fatalf("unexpected defaults: rounds=%d concurrency=%d", c.MaxToolRounds, c.MaxConcurrentReviews)

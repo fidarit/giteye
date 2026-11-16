@@ -2,7 +2,10 @@ package review
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -18,8 +21,9 @@ import (
 	mcpbridge "giteye/internal/mcp"
 	"giteye/internal/prompt"
 	"giteye/internal/webhook"
-	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+var errNotBotThread = errors.New("comment does not belong to a Giteye review thread")
 
 type Service struct {
 	cfg     config.Config
@@ -27,13 +31,33 @@ type Service struct {
 	ai      *llm.Client
 	manager *Manager
 	log     *slog.Logger
+	ctx     context.Context
+	cancel  context.CancelFunc
 }
 
-func NewService(c config.Config, logger *slog.Logger) *Service {
+func NewService(c config.Config, logger *slog.Logger) (*Service, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Service{cfg: c, gitea: gitea.New(c.Gitea.URL, c.Gitea.Token), ai: llm.New(llm.Config{BaseURL: c.AI.BaseURL, APIKey: c.AI.APIKey, Model: c.AI.Model, MaxToolRounds: c.MaxToolRounds}), manager: NewManager(c.MaxConcurrentReviews), log: logger}
+	giteaClient, err := gitea.New(c.Gitea.URL, c.Gitea.Token)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Service{
+		cfg:     c,
+		gitea:   giteaClient,
+		ai:      llm.New(llm.Config{BaseURL: c.AI.BaseURL, APIKey: c.AI.APIKey, Model: c.AI.Model, MaxToolRounds: c.MaxToolRounds}),
+		manager: NewManager(c.MaxConcurrentReviews),
+		log:     logger,
+		ctx:     ctx,
+		cancel:  cancel,
+	}, nil
+}
+
+func (s *Service) Shutdown(ctx context.Context) error {
+	s.cancel()
+	return s.manager.Shutdown(ctx)
 }
 
 func (s *Service) Handler() http.Handler {
@@ -42,7 +66,7 @@ func (s *Service) Handler() http.Handler {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
 	})
-	mux.Handle("POST /webhook", webhook.Handler(s.cfg.Webhook.Secret, 2<<20, func(w http.ResponseWriter, r *http.Request, body []byte) { s.accept(w, r, body) }))
+	mux.Handle("POST /webhook", webhook.Handler(s.cfg.Webhook.Secret, webhook.MaxPayloadBytes, func(w http.ResponseWriter, r *http.Request, body []byte) { s.accept(w, r, body) }))
 	return mux
 }
 
@@ -53,7 +77,7 @@ func (s *Service) accept(w http.ResponseWriter, r *http.Request, body []byte) {
 		return
 	}
 	kind := webhook.Classify(r.Header.Get("X-Gitea-Event-Type"), e, s.cfg.Gitea.BotUsername)
-	if kind == "ignore" {
+	if kind == webhook.TriggerIgnore {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -74,44 +98,21 @@ func (s *Service) accept(w http.ResponseWriter, r *http.Request, body []byte) {
 	}
 	key := fmt.Sprintf("%s/%s#%d", owner, repo, n)
 	delivery := r.Header.Get("X-Gitea-Delivery")
-	if kind == "thread" {
-		comments, err := s.gitea.ReviewComments(r.Context(), owner, repo, n)
-		if err != nil {
-			cause := s.safeError(err)
-			s.log.Error("review failed", "pr", key, "cause", cause)
-			_, _, _, notify := s.cfg.ForRepo(owner, repo)
-			if notify {
-				_ = s.gitea.FailureComment(r.Context(), owner, repo, n, failureComment())
-			}
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		if e.Comment.InReplyTo == 0 && e.Review.ID > 0 {
-			actor := webhook.Username(e.Sender)
-			if actor == "" {
-				actor = webhook.Username(e.Review.User)
-			}
-			if c, found := reviewReply(e.Review.ID, actor, comments); found {
-				e.Comment = webhook.Comment{ID: c.ID, Body: c.Body, User: webhook.User{Login: userName(c.User)}, InReplyTo: c.InReplyTo, Path: c.Path, Line: c.Line, HTMLURL: c.HTMLURL}
-			}
-		}
-		if _, ok := threadRoot(e.Comment.InReplyTo, comments, s.cfg.Gitea.BotUsername); !ok {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
+	if delivery == "" {
+		digest := sha256.Sum256(body)
+		delivery = hex.EncodeToString(digest[:])
 	}
-	s.manager.Start(context.Background(), key, delivery, func(ctx context.Context) {
+	scheduled := s.manager.Start(s.ctx, key, delivery, func(ctx context.Context) {
 		started := time.Now()
-		s.log.Info("review started", "pr", key, "kind", kind, "model", s.cfg.AI.Model)
+		s.log.Info("review started", "pr", key, "kind", kind.String(), "model", s.cfg.AI.Model)
 		usage, err := s.run(ctx, owner, repo, n, kind, e)
-		attrs := []any{"pr", key, "kind", kind, "model", s.cfg.AI.Model, "duration", time.Since(started).Round(time.Millisecond), "tool_calls", usage.ToolCalls, "tool_rounds", usage.ToolRounds, "usage_available", usage.Available}
+		attrs := []any{"pr", key, "kind", kind.String(), "model", s.cfg.AI.Model, "duration", time.Since(started).Round(time.Millisecond), "tool_calls", usage.ToolCalls, "tool_rounds", usage.ToolRounds, "usage_available", usage.Available}
 		if usage.Available {
 			attrs = append(attrs,
 				"input_tokens", usage.InputTokens,
 				"output_tokens", usage.OutputTokens,
 				"total_tokens", usage.TotalTokens,
 				"cached_input_tokens", usage.CachedInput,
-				"cache_write_tokens", usage.CacheWriteInput,
 			)
 		}
 		if err == nil {
@@ -122,13 +123,21 @@ func (s *Service) accept(w http.ResponseWriter, r *http.Request, body []byte) {
 			s.log.Info("review finished", append(attrs, "status", "canceled")...)
 			return
 		}
+		if errors.Is(err, errNotBotThread) {
+			s.log.Info("review finished", append(attrs, "status", "ignored")...)
+			return
+		}
 		cause := s.safeError(err)
 		s.log.Error("review finished", append(attrs, "status", "failed", "cause", cause)...)
-		_, _, _, notify := s.cfg.ForRepo(owner, repo)
-		if notify {
-			_ = s.gitea.FailureComment(ctx, owner, repo, n, failureComment())
+		if s.cfg.ForRepo(owner, repo).NotifyOnFailure {
+			if commentErr := s.gitea.FailureComment(ctx, owner, repo, n, failureComment()); commentErr != nil {
+				s.log.Error("failure comment could not be posted", "pr", key, "cause", s.safeError(commentErr))
+			}
 		}
 	})
+	if !scheduled {
+		s.log.Debug("review event was not scheduled", "pr", key)
+	}
 	w.WriteHeader(http.StatusAccepted)
 }
 
@@ -169,7 +178,7 @@ type contextData struct {
 	IssueComments, ReviewComments []gitea.Comment
 }
 
-func (s *Service) load(ctx context.Context, o, r string, n int64) (contextData, error) {
+func (s *Service) load(ctx context.Context, o, r string, n int64, includeDiscussion bool) (contextData, error) {
 	var d contextData
 	var err error
 	if d.PR, err = s.gitea.Pull(ctx, o, r, n); err != nil {
@@ -181,61 +190,57 @@ func (s *Service) load(ctx context.Context, o, r string, n int64) (contextData, 
 	if d.Reviews, err = s.gitea.Reviews(ctx, o, r, n); err != nil {
 		return d, err
 	}
-	if d.IssueComments, err = s.gitea.IssueComments(ctx, o, r, n); err != nil {
-		return d, err
+	if includeDiscussion {
+		if d.IssueComments, err = s.gitea.IssueComments(ctx, o, r, n); err != nil {
+			return d, err
+		}
 	}
-	if d.ReviewComments, err = s.gitea.ReviewComments(ctx, o, r, n); err != nil {
+	if d.ReviewComments, err = s.gitea.ReviewComments(ctx, o, r, n, d.Reviews); err != nil {
 		return d, err
 	}
 	return d, nil
 }
 
-func (s *Service) run(ctx context.Context, o, r string, n int64, kind string, e webhook.Event) (llm.Usage, error) {
-	d, err := s.load(ctx, o, r, n)
+func (s *Service) run(ctx context.Context, o, r string, n int64, kind webhook.Trigger, e webhook.Event) (llm.Usage, error) {
+	includeHistory := kind != webhook.TriggerThreadReply
+	d, err := s.load(ctx, o, r, n, includeHistory)
 	if err != nil {
 		return llm.Usage{}, err
 	}
-	language, override, addition, _ := s.cfg.ForRepo(o, r)
-	system := prompt.Build(override, addition, language)
-	user := reviewContext(o, r, d, s.cfg.Gitea.BotUsername, kind != "thread")
+	settings := s.cfg.ForRepo(o, r)
+	system := prompt.Build(settings.SystemPromptOverride, settings.SystemPromptAddition, settings.Language)
+	user := reviewContext(o, r, d, s.cfg.Gitea.BotUsername, includeHistory)
 	var targetID int64
-	if kind == "thread" {
+	if kind == webhook.TriggerThreadReply {
+		if e.Comment.InReplyTo == 0 && e.Review.ID > 0 {
+			actor := webhook.Username(e.Sender)
+			if actor == "" {
+				actor = webhook.Username(e.Review.User)
+			}
+			if comment, found := reviewReply(e.Review.ID, actor, d.ReviewComments); found {
+				e.Comment = toWebhookComment(comment)
+			}
+		}
 		root, ok := threadRoot(e.Comment.InReplyTo, d.ReviewComments, s.cfg.Gitea.BotUsername)
 		if !ok {
-			return llm.Usage{}, nil
+			return llm.Usage{}, errNotBotThread
 		}
 		targetID = root.ID
 		user += "\n\nActive bot thread:\n" + threadContext(root, e.Comment, d.ReviewComments)
 	}
-	var session *mcp.ClientSession
-	var tools []llm.Tool
-	toolNames := map[string]string{}
-	var call func(context.Context, string, map[string]any) (any, error)
-	if s.cfg.MCP.URL != "" {
-		bridge := mcpbridge.Client{URL: s.cfg.MCP.URL, Token: s.cfg.MCP.Token, AuthHeader: s.cfg.MCP.AuthHeader}
-		session, err = bridge.Connect(ctx)
-		if err == nil {
-			defer session.Close()
-			var discovered []mcpbridge.Tool
-			discovered, err = mcpbridge.List(ctx, session)
-			if err == nil {
-				for _, t := range discovered {
-					schema, _ := json.Marshal(t.InputSchema)
-					if len(schema) == 0 || string(schema) == "null" {
-						schema = json.RawMessage(`{"type":"object"}`)
-					}
-					name := openAIToolName(t.Name, toolNames)
-					toolNames[name] = t.Name
-					tools = append(tools, llm.Tool{Type: "function", Function: llm.Function{Name: name, Description: t.Description, Parameters: schema}})
-				}
-			}
-		}
-		if err != nil {
-			s.log.Warn("MCP unavailable; continuing with diff-only review")
-			session = nil
-			tools = nil
-		}
+	session, tools, toolNames, err := s.discoverMCPTools(ctx)
+	if err != nil {
+		s.log.Warn("MCP unavailable; continuing with diff-only review", "cause", s.safeError(err))
+		session, tools, toolNames = nil, nil, nil
 	}
+	if session != nil {
+		defer func() {
+			if err := session.Close(); err != nil {
+				s.log.Warn("close MCP session failed", "cause", s.safeError(err))
+			}
+		}()
+	}
+	var call func(context.Context, string, map[string]any) (any, error)
 	if session != nil {
 		call = func(c context.Context, name string, args map[string]any) (any, error) {
 			actual, ok := toolNames[name]
@@ -246,7 +251,7 @@ func (s *Service) run(ctx context.Context, o, r string, n int64, kind string, e 
 			defer cancel()
 			value, err := mcpbridge.Call(callCtx, session, actual, args)
 			if err != nil {
-				s.log.Warn("MCP tool call failed; continuing review")
+				s.log.Warn("MCP tool call failed", "tool", actual, "cause", s.safeError(err))
 			}
 			return value, err
 		}
@@ -255,10 +260,10 @@ func (s *Service) run(ctx context.Context, o, r string, n int64, kind string, e 
 	if err != nil {
 		return result.Usage, err
 	}
-	if kind == "thread" {
+	if kind == webhook.TriggerThreadReply {
 		comments := diffvalidate.GiteaComments(d.Diff, toDiffComments(result.Comments))
 		if len(comments) > 0 {
-			if err := s.gitea.CreateReview(ctx, o, r, n, d.PR.Head.SHA, "COMMENT", result.Summary, comments); err != nil {
+			if err := s.gitea.CreateReview(ctx, o, r, n, d.PR.Head.SHA, gitea.ReviewEventComment, result.Summary, comments); err != nil {
 				return result.Usage, err
 			}
 		}
@@ -269,11 +274,56 @@ func (s *Service) run(ctx context.Context, o, r string, n int64, kind string, e 
 		return result.Usage, s.gitea.Reply(ctx, o, r, n, targetID, threadReply)
 	}
 	comments := diffvalidate.GiteaComments(d.Diff, toDiffComments(result.Comments))
-	event := "COMMENT"
+	event := gitea.ReviewEventComment
 	if result.Event == "APPROVE" && len(comments) == 0 {
-		event = "APPROVED"
+		event = gitea.ReviewEventApprove
 	}
 	return result.Usage, s.gitea.CreateReview(ctx, o, r, n, d.PR.Head.SHA, event, result.Summary, comments)
+}
+
+func (s *Service) discoverMCPTools(ctx context.Context) (*mcpbridge.Session, []llm.Tool, map[string]string, error) {
+	if s.cfg.MCP.URL == "" {
+		return nil, nil, nil, nil
+	}
+	bridge := mcpbridge.Client{URL: s.cfg.MCP.URL, Token: s.cfg.MCP.Token, AuthHeader: s.cfg.MCP.AuthHeader}
+	session, err := bridge.Connect(ctx)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	discovered, err := mcpbridge.List(ctx, session)
+	if err != nil {
+		closeErr := session.Close()
+		return nil, nil, nil, errors.Join(fmt.Errorf("list MCP tools: %w", err), closeErr)
+	}
+	if len(discovered) == 0 {
+		if err := session.Close(); err != nil {
+			return nil, nil, nil, fmt.Errorf("close MCP session: %w", err)
+		}
+		return nil, nil, nil, nil
+	}
+
+	tools := make([]llm.Tool, 0, len(discovered))
+	toolNames := make(map[string]string, len(discovered))
+	for _, discoveredTool := range discovered {
+		schema, err := json.Marshal(discoveredTool.InputSchema)
+		if err != nil {
+			closeErr := session.Close()
+			return nil, nil, nil, errors.Join(fmt.Errorf("encode schema for MCP tool %q: %w", discoveredTool.Name, err), closeErr)
+		}
+		if len(schema) == 0 || string(schema) == "null" {
+			schema = json.RawMessage(`{"type":"object"}`)
+		}
+		name := openAIToolName(discoveredTool.Name, toolNames)
+		toolNames[name] = discoveredTool.Name
+		tools = append(tools, llm.Tool{
+			Type: "function",
+			Function: llm.Function{
+				Name: name, Description: discoveredTool.Description,
+				Parameters: schema,
+			},
+		})
+	}
+	return session, tools, toolNames, nil
 }
 
 func openAIToolName(name string, used map[string]string) string {
@@ -336,6 +386,15 @@ func userName(u gitea.User) string {
 	return u.Username
 }
 
+func toWebhookComment(comment gitea.Comment) webhook.Comment {
+	return webhook.Comment{
+		ID: comment.ID, Body: comment.Body,
+		User:      webhook.User{Login: userName(comment.User)},
+		InReplyTo: comment.InReplyTo, Path: comment.Path, Line: comment.Line,
+		HTMLURL: comment.HTMLURL,
+	}
+}
+
 func threadRoot(parent int64, comments []gitea.Comment, bot string) (gitea.Comment, bool) {
 	byID := map[int64]gitea.Comment{}
 	for _, c := range comments {
@@ -361,16 +420,25 @@ func threadRoot(parent int64, comments []gitea.Comment, bot string) (gitea.Comme
 func threadContext(root gitea.Comment, reply webhook.Comment, comments []gitea.Comment) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Root comment #%d by Giteye: %s\n", root.ID, root.Body)
+	children := make(map[int64][]gitea.Comment, len(comments))
+	for _, comment := range comments {
+		if comment.InReplyTo > 0 {
+			children[comment.InReplyTo] = append(children[comment.InReplyTo], comment)
+		}
+	}
 	seen := map[int64]bool{root.ID: true}
+	queue := []int64{root.ID}
 	var thread []gitea.Comment
-	for changed := true; changed; {
-		changed = false
-		for _, c := range comments {
-			if !seen[c.ID] && seen[c.InReplyTo] {
-				seen[c.ID] = true
-				changed = true
-				thread = append(thread, c)
+	for len(queue) > 0 {
+		parent := queue[0]
+		queue = queue[1:]
+		for _, comment := range children[parent] {
+			if seen[comment.ID] {
+				continue
 			}
+			seen[comment.ID] = true
+			thread = append(thread, comment)
+			queue = append(queue, comment.ID)
 		}
 	}
 	sort.SliceStable(thread, func(i, j int) bool { return thread[i].CreatedAt < thread[j].CreatedAt })

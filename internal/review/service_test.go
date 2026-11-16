@@ -9,7 +9,13 @@ import (
 )
 
 func TestHealthz(t *testing.T) {
-	service := NewService(config.Config{}, nil)
+	service, err := NewService(config.Config{
+		Gitea: config.Gitea{URL: "https://gitea.example.test", Token: "token"},
+		AI:    config.AI{BaseURL: "https://ai.example.test/v1", APIKey: "key", Model: "test-model"},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	response := httptest.NewRecorder()
 	service.Handler().ServeHTTP(response, httptest.NewRequest("GET", "/healthz", nil))
 	if response.Code != 200 {

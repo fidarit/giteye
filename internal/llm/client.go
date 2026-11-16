@@ -33,14 +33,13 @@ type Result struct {
 }
 
 type Usage struct {
-	ToolCalls       int
-	ToolRounds      int
-	InputTokens     int64
-	OutputTokens    int64
-	TotalTokens     int64
-	CachedInput     int64
-	CacheWriteInput int64
-	Available       bool
+	ToolCalls    int
+	ToolRounds   int
+	InputTokens  int64
+	OutputTokens int64
+	TotalTokens  int64
+	CachedInput  int64
+	Available    bool
 }
 
 type Tool struct {
@@ -108,8 +107,7 @@ func (c *Client) Review(ctx context.Context, system, user string, tools []Tool, 
 		usage.OutputTokens += completion.Usage.CompletionTokens
 		usage.TotalTokens += completion.Usage.TotalTokens
 		usage.CachedInput += completion.Usage.PromptTokensDetails.CachedTokens
-		usage.CacheWriteInput += completion.Usage.PromptTokensDetails.CacheWriteTokens
-		usage.Available = usage.Available || completion.Usage.TotalTokens > 0 || completion.Usage.PromptTokens > 0 || completion.Usage.CompletionTokens > 0 || completion.Usage.PromptTokensDetails.CachedTokens > 0 || completion.Usage.PromptTokensDetails.CacheWriteTokens > 0
+		usage.Available = usage.Available || completion.Usage.TotalTokens > 0 || completion.Usage.PromptTokens > 0 || completion.Usage.CompletionTokens > 0 || completion.Usage.PromptTokensDetails.CachedTokens > 0
 		if len(completion.Choices) == 0 {
 			return Result{Usage: usage}, errors.New("AI endpoint returned no choices")
 		}

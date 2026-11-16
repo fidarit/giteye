@@ -8,10 +8,12 @@ import (
 
 type job struct{ cancel context.CancelFunc }
 type Manager struct {
-	mu     sync.Mutex
-	active map[string]*job
-	seen   map[string]time.Time
-	sem    chan struct{}
+	mu      sync.Mutex
+	active  map[string]*job
+	seen    map[string]time.Time
+	sem     chan struct{}
+	closed  bool
+	workers sync.WaitGroup
 }
 
 func NewManager(concurrency int) *Manager {
@@ -25,6 +27,10 @@ func NewManager(concurrency int) *Manager {
 // same PR before scheduling the newer relevant event.
 func (m *Manager) Start(parent context.Context, key, delivery string, fn func(context.Context)) bool {
 	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return false
+	}
 	now := time.Now()
 	for id, t := range m.seen {
 		if now.Sub(t) > 24*time.Hour {
@@ -44,8 +50,10 @@ func (m *Manager) Start(parent context.Context, key, delivery string, fn func(co
 	ctx, cancel := context.WithCancel(parent)
 	j := &job{cancel: cancel}
 	m.active[key] = j
+	m.workers.Add(1)
 	m.mu.Unlock()
 	go func() {
+		defer m.workers.Done()
 		defer func() {
 			m.mu.Lock()
 			if m.active[key] == j {
@@ -63,4 +71,27 @@ func (m *Manager) Start(parent context.Context, key, delivery string, fn func(co
 		fn(ctx)
 	}()
 	return true
+}
+
+// Shutdown prevents new work, cancels active reviews, and waits for workers to
+// finish or for ctx to expire.
+func (m *Manager) Shutdown(ctx context.Context) error {
+	m.mu.Lock()
+	m.closed = true
+	for _, active := range m.active {
+		active.cancel()
+	}
+	m.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		m.workers.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
