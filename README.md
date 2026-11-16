@@ -65,7 +65,7 @@ docker compose up -d
 - Review request delivery starts one full review. A repeated delivery ID is suppressed; a newer relevant request for that PR cancels its in-flight work. Reviews across all PRs share the configured concurrency limit.
 - A push alone is ignored. A subsequent explicit reviewer request starts a fresh full review, with earlier bot findings and PR discussion included in context.
 - Replies are handled only when the parent chain reaches a comment written by Giteye. The model sees the active thread, PR metadata, and current diff. It can close politely, explain a finding, or re-check changed code.
-- Inline comments are validated independently, so a stale or invalid model line cannot reject the rest of the review.
+- Inline comments are validated independently, so a stale or invalid model line cannot reject the rest of the review. When inline comments exist, the model can omit a separate summary if it would only repeat them.
 - MCP connection or discovery failures are logged as warnings and the review continues without tools.
 - Console logs mark review start and completion, including duration, tool call counts, and token usage when the AI provider returns it. Cached input counts are included when the provider reports them; monetary cost is not estimated.
 

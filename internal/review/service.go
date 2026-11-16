@@ -262,18 +262,24 @@ func (s *Service) run(ctx context.Context, o, r string, n int64, kind webhook.Tr
 	}
 	if kind == webhook.TriggerThreadReply {
 		comments := diffvalidate.GiteaComments(d.Diff, toDiffComments(result.Comments))
+		threadReply := result.Summary
+		if result.ThreadReply != nil && strings.TrimSpace(*result.ThreadReply) != "" {
+			threadReply = *result.ThreadReply
+		}
+		if strings.TrimSpace(threadReply) == "" {
+			return result.Usage, errors.New("AI returned an empty thread reply")
+		}
 		if len(comments) > 0 {
 			if err := s.gitea.CreateReview(ctx, o, r, n, d.PR.Head.SHA, gitea.ReviewEventComment, result.Summary, comments); err != nil {
 				return result.Usage, err
 			}
 		}
-		threadReply := result.Summary
-		if result.ThreadReply != nil && strings.TrimSpace(*result.ThreadReply) != "" {
-			threadReply = *result.ThreadReply
-		}
 		return result.Usage, s.gitea.Reply(ctx, o, r, n, targetID, threadReply)
 	}
 	comments := diffvalidate.GiteaComments(d.Diff, toDiffComments(result.Comments))
+	if len(comments) == 0 && strings.TrimSpace(result.Summary) == "" {
+		return result.Usage, errors.New("AI returned neither a review summary nor valid inline comments")
+	}
 	event := gitea.ReviewEventComment
 	if result.Event == "APPROVE" && len(comments) == 0 {
 		event = gitea.ReviewEventApprove

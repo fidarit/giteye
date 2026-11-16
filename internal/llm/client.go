@@ -123,9 +123,6 @@ func (c *Client) Review(ctx context.Context, system, user string, tools []Tool, 
 			if result.Event != "APPROVE" {
 				result.Event = "COMMENT"
 			}
-			if strings.TrimSpace(result.Summary) == "" {
-				result.Summary = "Review completed."
-			}
 			result.Usage = usage
 			return result, nil
 		}
