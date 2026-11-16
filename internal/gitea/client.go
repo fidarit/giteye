@@ -2,12 +2,7 @@ package gitea
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"io"
 	"net/http"
-	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
@@ -158,35 +153,38 @@ func (c *Client) ReviewComments(ctx context.Context, owner, repo string, number 
 	if c.err != nil {
 		return nil, c.err
 	}
-	// The SDK's PullReviewComment currently omits Gitea's in_reply_to field.
-	// Keep this typed endpoint read on the SDK; decode the aggregate comment
-	// endpoint into the local type so replies can still be matched to their root.
-	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/pulls/%d/comments", c.BaseURL, url.PathEscape(owner), url.PathEscape(repo), number)
+	// Gitea lists inline comments under each review:
+	// GET /repos/{owner}/{repo}/pulls/{index}/reviews/{id}/comments.
 	var out []Comment
 	for page := 1; ; page++ {
-		u := endpoint + "?limit=50&page=" + strconv.Itoa(page)
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		reviews, _, err := c.api.PullRequests.ListPullReviews(ctx, owner, repo, number, sdk.ListPullReviewsOptions{ListOptions: sdk.ListOptions{Page: page, PageSize: 50}})
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Set("Authorization", "token "+c.Token)
-		req.Header.Set("Accept", "application/json")
-		resp, err := c.http.Do(req)
-		if err != nil {
-			return nil, err
+		for _, review := range reviews {
+			if review == nil {
+				continue
+			}
+			items, _, err := c.api.PullRequests.ListPullReviewComments(ctx, owner, repo, number, review.ID)
+			if err != nil {
+				return nil, err
+			}
+			for _, item := range items {
+				if item == nil {
+					continue
+				}
+				comment := Comment{
+					ID: item.ID, Body: item.Body, ReviewID: item.ReviewID,
+					Path: item.Path, Position: int(item.LineNum),
+					HTMLURL: item.HTMLURL, CreatedAt: item.Created.Format(time.RFC3339Nano),
+				}
+				if item.Reviewer != nil {
+					comment.User = fromSDKUser(item.Reviewer)
+				}
+				out = append(out, comment)
+			}
 		}
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			resp.Body.Close()
-			return nil, fmt.Errorf("Gitea API returned HTTP %d", resp.StatusCode)
-		}
-		var batch []Comment
-		decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 32<<20)).Decode(&batch)
-		resp.Body.Close()
-		if decodeErr != nil {
-			return nil, decodeErr
-		}
-		out = append(out, batch...)
-		if len(batch) < 50 {
+		if len(reviews) < 50 {
 			return out, nil
 		}
 	}
