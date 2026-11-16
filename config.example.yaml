@@ -1,0 +1,32 @@
+listen_addr: ":8080"
+
+gitea:
+  url: "https://gitea.example.com"
+  token: ""
+  bot_username: "giteye"
+
+webhook:
+  secret: ""
+
+ai:
+  base_url: "https://api.openai.com/v1"
+  api_key: ""
+  model: "gpt-4.1-mini"
+
+mcp:
+  url: ""                 # unset or empty disables MCP
+  token: ""
+  auth_header: "Authorization"
+
+notify_on_failure: true
+max_concurrent_reviews: 4
+max_tool_rounds: 6
+review_language: "ru"
+system_prompt_override: "" # replace the complete default prompt
+system_prompt_addition: "" # append extra instructions to the selected prompt
+
+repositories:
+  example/project:
+    review_language: "en"
+    system_prompt_addition: "Prefer concise comments."
+    notify_on_failure: false

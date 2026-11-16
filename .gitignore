@@ -1,0 +1,10 @@
+# Local configuration and secrets
+config.yaml
+.env
+.env.*
+!.env.example
+
+# Go build and test artifacts
+/giteye
+*.test
+coverage.out
