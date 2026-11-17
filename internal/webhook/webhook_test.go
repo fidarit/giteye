@@ -42,6 +42,14 @@ func TestHandlerRejectsBadSignature(t *testing.T) {
 }
 
 func TestClassifyStrictTriggers(t *testing.T) {
+	event, err := Decode([]byte(`{"action":"created","is_pull":true,"comment":{"id":7782,"body":"точно?","user":{"login":"mullayanov"}},"sender":{"login":"mullayanov"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := Classify(EventPullRequestComment, event, "giteye"); got != TriggerThreadReply {
+		t.Fatalf("Gitea PR comment payload classified as %q", got)
+	}
+
 	botRequest := Event{Action: "review_requested", RequestedReviewer: User{Login: "giteye"}}
 	if got := Classify(EventPullRequestReviewRequest, botRequest, "giteye"); got != TriggerReviewRequest {
 		t.Fatalf("review request classified as %q", got)
@@ -55,21 +63,21 @@ func TestClassifyStrictTriggers(t *testing.T) {
 	if got := Classify("pull_request_sync", push, "giteye"); got != TriggerIgnore {
 		t.Fatalf("push classified as %q", got)
 	}
-	reply := Event{Action: "created", Comment: Comment{InReplyTo: 42, User: User{Login: "alice"}}}
-	if got := Classify(EventPullRequestReviewComment, reply, "giteye"); got != TriggerThreadReply {
-		t.Fatalf("thread reply classified as %q", got)
+	reply := Event{Action: "created", IsPull: true, Comment: Comment{ID: 42, User: User{Login: "alice"}}}
+	if got := Classify(EventPullRequestComment, reply, "giteye"); got != TriggerThreadReply {
+		t.Fatalf("PR comment candidate classified as %q", got)
 	}
+	reply.IsPull = false
+	if got := Classify(EventPullRequestComment, reply, "giteye"); got != TriggerIgnore {
+		t.Fatalf("non-PR comment classified as %q", got)
+	}
+	reply.IsPull = true
 	reply.Comment.User = User{Login: "giteye"}
-	if got := Classify(EventPullRequestReviewComment, reply, "giteye"); got != TriggerIgnore {
+	if got := Classify(EventPullRequestComment, reply, "giteye"); got != TriggerIgnore {
 		t.Fatalf("bot comment classified as %q", got)
 	}
-	reviewReply := Event{Action: "reviewed", Review: Review{ID: 7, User: User{Login: "alice"}}, Sender: User{Login: "alice"}}
-	if got := Classify(EventPullRequestReviewComment, reviewReply, "giteye"); got != TriggerThreadReply {
-		t.Fatalf("review comment event classified as %q", got)
-	}
-	reviewReply.Sender = User{Login: "giteye"}
-	reviewReply.Review.User = User{Login: "giteye"}
-	if got := Classify(EventPullRequestReviewComment, reviewReply, "giteye"); got != TriggerIgnore {
-		t.Fatalf("bot review event classified as %q", got)
+	review := Event{Action: "reviewed", Review: Review{ID: 7, User: User{Login: "alice"}}, Sender: User{Login: "alice"}}
+	if got := Classify(EventPullRequestReviewComment, review, "giteye"); got != TriggerIgnore {
+		t.Fatalf("submitted review classified as a thread reply: %q", got)
 	}
 }

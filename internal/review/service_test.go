@@ -2,10 +2,12 @@ package review
 
 import (
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"giteye/internal/config"
 	"giteye/internal/gitea"
+	"giteye/internal/webhook"
 )
 
 func TestHealthz(t *testing.T) {
@@ -23,19 +25,25 @@ func TestHealthz(t *testing.T) {
 	}
 }
 
-func TestReplyLookupRequiresBotAncestor(t *testing.T) {
+func TestReplyLookupRequiresBotCommentAtSameReviewPosition(t *testing.T) {
 	comments := []gitea.Comment{
-		{ID: 10, Body: "bot finding", User: gitea.User{Login: "giteye"}},
-		{ID: 11, Body: "user reply", User: gitea.User{Login: "alice"}, InReplyTo: 10, ReviewID: 7},
+		{ID: 10, Body: "bot finding", User: gitea.User{Login: "giteye"}, ReviewID: 7, Path: "main.go", Position: 14, CreatedAt: "2026-11-17T04:40:00Z"},
+		{ID: 11, Body: "user reply", User: gitea.User{Login: "alice"}, ReviewID: 7, Path: "main.go", Position: 14, CreatedAt: "2026-11-17T04:48:23Z"},
 	}
-	if comment, ok := reviewReply(7, "alice", comments); !ok || comment.ID != 11 {
-		t.Fatalf("expected reply comment 11, got %#v, %v", comment, ok)
+	root, reply, ok := resolveThreadReply(webhook.Comment{ID: 11}, "alice", comments, "giteye")
+	if !ok || root.ID != 10 || reply.ID != 11 {
+		t.Fatalf("expected root/reply 10/11, got %#v/%#v, %v", root, reply, ok)
 	}
-	if _, ok := threadRoot(11, comments, "giteye"); !ok {
-		t.Fatal("reply to bot comment was not recognized")
+	if context := threadContext(root, reply, comments); !strings.Contains(context, "current reply") {
+		t.Fatalf("thread context did not include the current reply: %s", context)
 	}
 	comments[0].User = gitea.User{Login: "mallory"}
-	if _, ok := threadRoot(11, comments, "giteye"); ok {
+	if _, _, ok := resolveThreadReply(webhook.Comment{ID: 11}, "alice", comments, "giteye"); ok {
 		t.Fatal("reply to non-bot comment was treated as an active bot thread")
+	}
+	comments[0].User = gitea.User{Login: "giteye"}
+	comments = append(comments, gitea.Comment{ID: 12, Body: "another bot finding", User: gitea.User{Login: "giteye"}, ReviewID: 7, Path: "main.go", Position: 14, CreatedAt: "2026-11-17T04:41:00Z"})
+	if _, _, ok := resolveThreadReply(webhook.Comment{ID: 11}, "alice", comments, "giteye"); ok {
+		t.Fatal("ambiguous bot comments at the same position were treated as one thread")
 	}
 }

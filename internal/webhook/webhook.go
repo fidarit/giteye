@@ -46,6 +46,7 @@ type Event struct {
 	Comment           Comment     `json:"comment"`
 	Review            Review      `json:"review"`
 	Sender            User        `json:"sender"`
+	IsPull            bool        `json:"is_pull"`
 }
 type PullRequest struct {
 	Number             int64  `json:"number"`
@@ -63,13 +64,10 @@ type User struct {
 	Username string `json:"username"`
 }
 type Comment struct {
-	ID        int64  `json:"id"`
-	Body      string `json:"body"`
-	User      User   `json:"user"`
-	InReplyTo int64  `json:"in_reply_to"`
-	Path      string `json:"path"`
-	Line      int    `json:"line"`
-	HTMLURL   string `json:"html_url"`
+	ID      int64  `json:"id"`
+	Body    string `json:"body"`
+	User    User   `json:"user"`
+	HTMLURL string `json:"html_url"`
 }
 type Review struct {
 	ID    int64  `json:"id"`
@@ -104,10 +102,9 @@ func Username(u User) string {
 	return u.Username
 }
 
-// Classify uses the normalized X-Gitea-Event plus specific
-// X-Gitea-Event-Type. Review requests have action=review_requested and the
-// requested_reviewer object; review replies are PR timeline comments or
-// review-thread comments.
+// Classify uses the specific X-Gitea-Event-Type. A PR comment event is only a
+// thread-reply candidate; the service verifies its comment ID against review
+// comments before invoking the model.
 func Classify(eventType string, e Event, bot string) Trigger {
 	if eventType == EventPullRequestReviewRequest && e.Action == "review_requested" && strings.EqualFold(Username(e.RequestedReviewer), bot) {
 		return TriggerReviewRequest
@@ -119,12 +116,7 @@ func Classify(eventType string, e Event, bot string) Trigger {
 	if actor == "" {
 		actor = Username(e.Review.User)
 	}
-	// Review-comment webhooks describe the submitted review in `review`; the
-	// individual reply may need to be resolved from review comments.
-	if eventType == EventPullRequestReviewComment && (e.Action == "reviewed" || e.Action == "created") && actor != "" && !strings.EqualFold(actor, bot) {
-		return TriggerThreadReply
-	}
-	if eventType == EventPullRequestComment && e.Action == "created" && !strings.EqualFold(actor, bot) && e.Comment.InReplyTo > 0 {
+	if eventType == EventPullRequestComment && e.Action == "created" && e.IsPull && e.Comment.ID > 0 && actor != "" && !strings.EqualFold(actor, bot) {
 		return TriggerThreadReply
 	}
 	return TriggerIgnore

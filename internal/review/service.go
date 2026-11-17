@@ -83,6 +83,9 @@ func (s *Service) accept(w http.ResponseWriter, r *http.Request, body []byte) {
 	}
 	kind := webhook.Classify(r.Header.Get("X-Gitea-Event-Type"), e, s.cfg.Gitea.BotUsername)
 	if kind == webhook.TriggerIgnore {
+		if e.IsPull && e.Comment.ID > 0 {
+			s.log.Info("PR comment webhook ignored", "event_type", r.Header.Get("X-Gitea-Event-Type"), "action", e.Action, "comment_id", e.Comment.ID)
+		}
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -166,16 +169,6 @@ func failureComment() string {
 	return "Giteye could not complete this review. Check the service logs for the cause, fix it, then retry the review request."
 }
 
-func reviewReply(reviewID int64, actor string, comments []gitea.Comment) (gitea.Comment, bool) {
-	var found gitea.Comment
-	for _, c := range comments {
-		if c.ReviewID == reviewID && c.InReplyTo > 0 && (actor == "" || strings.EqualFold(userName(c.User), actor)) && c.CreatedAt >= found.CreatedAt {
-			found = c
-		}
-	}
-	return found, found.ID > 0
-}
-
 type contextData struct {
 	PR                            gitea.PullRequest
 	Diff                          string
@@ -217,21 +210,12 @@ func (s *Service) run(ctx context.Context, o, r string, n int64, kind webhook.Tr
 	user := reviewContext(o, r, d, s.cfg.Gitea.BotUsername, includeHistory)
 	var targetID int64
 	if kind == webhook.TriggerThreadReply {
-		if e.Comment.InReplyTo == 0 && e.Review.ID > 0 {
-			actor := webhook.Username(e.Sender)
-			if actor == "" {
-				actor = webhook.Username(e.Review.User)
-			}
-			if comment, found := reviewReply(e.Review.ID, actor, d.ReviewComments); found {
-				e.Comment = toWebhookComment(comment)
-			}
-		}
-		root, ok := threadRoot(e.Comment.InReplyTo, d.ReviewComments, s.cfg.Gitea.BotUsername)
+		root, reply, ok := resolveThreadReply(e.Comment, webhook.Username(e.Sender), d.ReviewComments, s.cfg.Gitea.BotUsername)
 		if !ok {
 			return llm.Usage{}, errNotBotThread
 		}
 		targetID = root.ID
-		user += "\n\nActive bot thread:\n" + threadContext(root, e.Comment, d.ReviewComments)
+		user += "\n\nActive bot thread:\n" + threadContext(root, reply, d.ReviewComments)
 	}
 	if len(user) > s.cfg.Limits.ReviewContextBytes {
 		return llm.Usage{}, fmt.Errorf("review context exceeds the %d-byte safety limit", s.cfg.Limits.ReviewContextBytes)
@@ -425,60 +409,43 @@ func userName(u gitea.User) string {
 	return u.Username
 }
 
-func toWebhookComment(comment gitea.Comment) webhook.Comment {
-	return webhook.Comment{
-		ID: comment.ID, Body: comment.Body,
-		User:      webhook.User{Login: userName(comment.User)},
-		InReplyTo: comment.InReplyTo, Path: comment.Path, Line: comment.Line,
-		HTMLURL: comment.HTMLURL,
+func resolveThreadReply(eventComment webhook.Comment, actor string, comments []gitea.Comment, bot string) (gitea.Comment, gitea.Comment, bool) {
+	var reply gitea.Comment
+	for _, c := range comments {
+		if c.ID == eventComment.ID && (actor == "" || strings.EqualFold(userName(c.User), actor)) {
+			reply = c
+			break
+		}
 	}
+	if reply.ID == 0 || reply.ReviewID == 0 || reply.Path == "" || reply.Position <= 0 {
+		return gitea.Comment{}, gitea.Comment{}, false
+	}
+	var root gitea.Comment
+	for _, c := range comments {
+		if c.ID == reply.ID || c.ReviewID != reply.ReviewID || c.Path != reply.Path || c.Position != reply.Position || !strings.EqualFold(userName(c.User), bot) {
+			continue
+		}
+		if c.CreatedAt != "" && reply.CreatedAt != "" && c.CreatedAt > reply.CreatedAt {
+			continue
+		}
+		if root.ID != 0 {
+			// Multiple bot comments at the same diff position are ambiguous.
+			return gitea.Comment{}, gitea.Comment{}, false
+		}
+		root = c
+	}
+	return root, reply, root.ID != 0
 }
 
-func threadRoot(parent int64, comments []gitea.Comment, bot string) (gitea.Comment, bool) {
-	byID := map[int64]gitea.Comment{}
-	for _, c := range comments {
-		byID[c.ID] = c
-	}
-	seen := map[int64]bool{}
-	for parent > 0 {
-		if seen[parent] {
-			return gitea.Comment{}, false
-		}
-		seen[parent] = true
-		c, ok := byID[parent]
-		if !ok {
-			return gitea.Comment{}, false
-		}
-		if strings.EqualFold(userName(c.User), bot) {
-			return c, true
-		}
-		parent = c.InReplyTo
-	}
-	return gitea.Comment{}, false
-}
-func threadContext(root gitea.Comment, reply webhook.Comment, comments []gitea.Comment) string {
+func threadContext(root, reply gitea.Comment, comments []gitea.Comment) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Root comment #%d by Giteye: %s\n", root.ID, root.Body)
-	children := make(map[int64][]gitea.Comment, len(comments))
-	for _, comment := range comments {
-		if comment.InReplyTo > 0 {
-			children[comment.InReplyTo] = append(children[comment.InReplyTo], comment)
-		}
-	}
-	seen := map[int64]bool{root.ID: true}
-	queue := []int64{root.ID}
 	var thread []gitea.Comment
-	for len(queue) > 0 {
-		parent := queue[0]
-		queue = queue[1:]
-		for _, comment := range children[parent] {
-			if seen[comment.ID] {
-				continue
-			}
-			seen[comment.ID] = true
-			thread = append(thread, comment)
-			queue = append(queue, comment.ID)
+	for _, comment := range comments {
+		if comment.ID == root.ID || comment.ReviewID != root.ReviewID || comment.Path != root.Path || comment.Position != root.Position {
+			continue
 		}
+		thread = append(thread, comment)
 	}
 	sort.SliceStable(thread, func(i, j int) bool { return thread[i].CreatedAt < thread[j].CreatedAt })
 	foundReply := false
@@ -491,7 +458,7 @@ func threadContext(root gitea.Comment, reply webhook.Comment, comments []gitea.C
 		fmt.Fprintf(&b, "Reply #%d by %s%s: %s\n", c.ID, userName(c.User), marker, c.Body)
 	}
 	if !foundReply {
-		fmt.Fprintf(&b, "Current reply by %s: %s\n", webhook.Username(reply.User), reply.Body)
+		fmt.Fprintf(&b, "Current reply by %s: %s\n", userName(reply.User), reply.Body)
 	}
 	return b.String()
 }

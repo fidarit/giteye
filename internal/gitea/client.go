@@ -2,12 +2,9 @@ package gitea
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
@@ -15,11 +12,50 @@ import (
 )
 
 type Client struct {
-	api              *sdk.Client
-	baseURL          string
-	token            string
-	http             *http.Client
-	maxResponseBytes int
+	api *sdk.Client
+}
+
+type responseLimitTransport struct {
+	base     http.RoundTripper
+	maxBytes int64
+}
+
+func (t responseLimitTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(req)
+	path := req.URL.Path
+	if err == nil && resp != nil && resp.Body != nil && strings.Contains(path, "/pulls/") && strings.Contains(path, "/reviews/") && strings.HasSuffix(path, "/comments") {
+		resp.Body = &responseLimitBody{ReadCloser: resp.Body, remaining: t.maxBytes, maxBytes: t.maxBytes}
+	}
+	return resp, err
+}
+
+type responseLimitBody struct {
+	io.ReadCloser
+	remaining int64
+	maxBytes  int64
+}
+
+func (b *responseLimitBody) Read(p []byte) (int, error) {
+	if b.remaining < 0 {
+		return 0, fmt.Errorf("Gitea API response exceeds the %d-byte limit", b.maxBytes)
+	}
+	if b.remaining == 0 {
+		var extra [1]byte
+		n, err := b.ReadCloser.Read(extra[:])
+		if n > 0 {
+			return 0, fmt.Errorf("Gitea API response exceeds the %d-byte limit", b.maxBytes)
+		}
+		return 0, err
+	}
+	if int64(len(p)) > b.remaining+1 {
+		p = p[:b.remaining+1]
+	}
+	n, err := b.ReadCloser.Read(p)
+	b.remaining -= int64(n)
+	if b.remaining < 0 {
+		return n, fmt.Errorf("Gitea API response exceeds the %d-byte limit", b.maxBytes)
+	}
+	return n, err
 }
 
 type User struct {
@@ -48,9 +84,7 @@ type Comment struct {
 	ID        int64  `json:"id"`
 	Body      string `json:"body"`
 	User      User   `json:"user"`
-	InReplyTo int64  `json:"in_reply_to"`
 	Path      string `json:"path"`
-	Line      int    `json:"line"`
 	Position  int    `json:"position"`
 	ReviewID  int64  `json:"pull_request_review_id"`
 	HTMLURL   string `json:"html_url"`
@@ -83,13 +117,16 @@ func New(baseURL, token string, maxResponseBytes int) (*Client, error) {
 	if maxResponseBytes <= 0 {
 		maxResponseBytes = 32 << 20
 	}
-	httpClient := &http.Client{Timeout: 30 * time.Second}
+	httpClient := &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: responseLimitTransport{base: http.DefaultTransport, maxBytes: int64(maxResponseBytes)},
+	}
 	baseURL = strings.TrimRight(baseURL, "/")
 	api, err := sdk.NewClient(baseURL, sdk.SetToken(token), sdk.SetHTTPClient(httpClient))
 	if err != nil {
 		return nil, fmt.Errorf("initialize Gitea API client: %w", err)
 	}
-	return &Client{api: api, baseURL: baseURL, token: token, http: httpClient, maxResponseBytes: maxResponseBytes}, nil
+	return &Client{api: api}, nil
 }
 
 func (c *Client) Pull(ctx context.Context, owner, repo string, number int64) (PullRequest, error) {
@@ -167,56 +204,29 @@ func (c *Client) IssueComments(ctx context.Context, owner, repo string, number i
 }
 
 func (c *Client) ReviewComments(ctx context.Context, owner, repo string, number int64, reviews []Review) ([]Comment, error) {
-	// Gitea lists inline comments under each review:
-	// GET /repos/{owner}/{repo}/pulls/{index}/reviews/{id}/comments.
-	// Read the response locally because the SDK comment model omits in_reply_to.
 	var out []Comment
 	for _, review := range reviews {
-		items, err := c.listReviewComments(ctx, owner, repo, number, review.ID)
+		items, _, err := c.api.PullRequests.ListPullReviewComments(ctx, owner, repo, number, review.ID)
 		if err != nil {
 			return nil, fmt.Errorf("list inline comments for review %d on %s/%s#%d: %w", review.ID, owner, repo, number, err)
 		}
-		out = append(out, items...)
+		for _, item := range items {
+			if item == nil {
+				continue
+			}
+			comment := Comment{
+				ID: item.ID, Body: item.Body, ReviewID: item.ReviewID,
+				// Gitea's `position` is the offset in the review diff, not a file line number.
+				Path: item.Path, Position: int(item.LineNum),
+				CreatedAt: item.Created.Format(time.RFC3339Nano),
+			}
+			if item.Reviewer != nil {
+				comment.User = fromSDKUser(item.Reviewer)
+			}
+			out = append(out, comment)
+		}
 	}
 	return out, nil
-}
-
-func (c *Client) listReviewComments(ctx context.Context, owner, repo string, number, reviewID int64) ([]Comment, error) {
-	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/pulls/%d/reviews/%d/comments", c.baseURL, url.PathEscape(owner), url.PathEscape(repo), number, reviewID)
-	var out []Comment
-	for page := 1; ; page++ {
-		reqURL := endpoint + "?limit=50&page=" + strconv.Itoa(page)
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Authorization", "token "+c.token)
-		req.Header.Set("Accept", "application/json")
-		resp, err := c.http.Do(req)
-		if err != nil {
-			return nil, err
-		}
-		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-			resp.Body.Close()
-			return nil, fmt.Errorf("Gitea API returned HTTP %d", resp.StatusCode)
-		}
-		body, readErr := io.ReadAll(io.LimitReader(resp.Body, int64(c.maxResponseBytes)+1))
-		resp.Body.Close()
-		if readErr != nil {
-			return nil, fmt.Errorf("read Gitea review comments: %w", readErr)
-		}
-		if len(body) > c.maxResponseBytes {
-			return nil, fmt.Errorf("Gitea review comments response exceeds the %d-byte limit", c.maxResponseBytes)
-		}
-		var comments []Comment
-		if err := json.Unmarshal(body, &comments); err != nil {
-			return nil, fmt.Errorf("decode Gitea review comments: %w", err)
-		}
-		out = append(out, comments...)
-		if len(comments) < 50 {
-			return out, nil
-		}
-	}
 }
 
 func (c *Client) CreateReview(ctx context.Context, owner, repo string, number int64, commit string, event ReviewEvent, body string, comments []InlineComment) error {

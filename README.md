@@ -35,16 +35,16 @@ Create a Gitea webhook at repository settings (`/:owner/:repo/settings/hooks`), 
 - HTTP method: `POST`
 - Content type: `application/json`
 - Secret: the value of `WEBHOOK_SECRET` or `webhook.secret`
-- Events: **Pull Request Review Request**, **Pull Request Comments**, and **Pull Request Review Comments**
+- Events: **Pull Request Review Request** and **Pull Request Comments**
 
-The corresponding event types are `pull_request_review_request`, `pull_request_comment`, and `pull_request_review_comment`. The first event starts a review only when `action` is `review_requested` and the requested reviewer is the configured bot. `pull_request_sync` is not needed. Gitea signs the raw request body with HMAC-SHA256; Giteye verifies `X-Gitea-Signature` before decoding it.
+The corresponding event types are `pull_request_review_request` and `pull_request_comment`. The first starts a review only when `action` is `review_requested` and the requested reviewer is the configured bot. A created PR comment is checked against the current review comments and only handled when it belongs to an inline thread started by Giteye. `pull_request_review_comment` describes a submitted review, not an individual thread reply. `pull_request_sync` is not needed. Gitea signs the raw request body with HMAC-SHA256; Giteye verifies `X-Gitea-Signature` before decoding it.
 
 Create a dedicated bot account and request it as a reviewer on pull requests. For a classic access token, the required scopes are `read:repository`, `write:repository`, `read:issue`, and `write:issue`. The bot must also have access to each repository. Giteye reads pull request metadata, diff, reviews, and discussion comments through the Gitea API. It posts formal reviews, inline comments, thread replies, and—when enabled—a short failure comment.
 
 ## Review behavior
 
 - A reviewer request addressed to the bot starts a full review. A re-request starts another review with prior findings and discussion in context. Opening or synchronizing a pull request alone does not trigger a review.
-- A comment triggers a response only when its parent chain reaches a Giteye comment. The model sees that thread and the current diff; it can acknowledge an accepted finding, explain a disputed one, or re-check changed code.
+- A PR comment triggers a response only when its ID appears in the review-comment API and matches a unique Giteye comment in the same review, file, and diff position. The model sees that thread and the current diff; it can acknowledge an accepted finding, explain a disputed one, or re-check changed code.
 - Duplicate webhook deliveries are suppressed in memory. A newer relevant event for the same PR cancels its active review. `max_concurrent_reviews` limits work across all PRs.
 - Inline comments are posted only when their file and new-side line map to the current diff. Invalid comments are dropped. If valid inline comments exist, the model decides whether a separate summary adds useful information.
 - `notify_on_failure` defaults to `true`; it controls the generic PR note posted after a hard failure. The detailed cause is written to the service log.
