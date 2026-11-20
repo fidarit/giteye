@@ -208,6 +208,14 @@ func (s *Service) run(ctx context.Context, o, r string, n int64, kind webhook.Tr
 	settings := s.cfg.ForRepo(o, r)
 	system := prompt.Build(settings.SystemPromptOverride, settings.SystemPromptAddition, settings.Language)
 	user := reviewContext(o, r, d, s.cfg.Gitea.BotUsername, includeHistory)
+	omittedHistory := 0
+	omittedHistoryBytes := 0
+	if len(user) > s.cfg.Limits.ReviewContextBytes && includeHistory {
+		user, omittedHistory, omittedHistoryBytes = reviewContextWithinLimit(o, r, d, s.cfg.Gitea.BotUsername, s.cfg.Limits.ReviewContextBytes)
+		if omittedHistory > 0 {
+			s.log.Warn("omitted review history entries to fit context limit", "pr", fmt.Sprintf("%s/%s#%d", o, r, n), "count", omittedHistory, "bytes", omittedHistoryBytes)
+		}
+	}
 	var targetID int64
 	if kind == webhook.TriggerThreadReply {
 		root, reply, ok := resolveThreadReply(e.Comment, webhook.Username(e.Sender), d.ReviewComments, s.cfg.Gitea.BotUsername)
@@ -218,7 +226,7 @@ func (s *Service) run(ctx context.Context, o, r string, n int64, kind webhook.Tr
 		user += "\n\nActive bot thread:\n" + threadContext(root, reply, d.ReviewComments)
 	}
 	if len(user) > s.cfg.Limits.ReviewContextBytes {
-		return llm.Usage{}, fmt.Errorf("review context exceeds the %d-byte safety limit", s.cfg.Limits.ReviewContextBytes)
+		return llm.Usage{}, fmt.Errorf("review context is %d bytes and exceeds the %d-byte safety limit", len(user), s.cfg.Limits.ReviewContextBytes)
 	}
 	session, tools, toolNames, err := s.discoverMCPTools(ctx)
 	if err != nil {
@@ -396,6 +404,54 @@ func reviewContext(owner, repo string, d contextData, bot string, includeHistory
 	}
 	return b.String()
 }
+
+func reviewContextWithinLimit(owner, repo string, d contextData, bot string, limit int) (string, int, int) {
+	d.Reviews = append([]gitea.Review(nil), d.Reviews...)
+	d.IssueComments = append([]gitea.Comment(nil), d.IssueComments...)
+	d.ReviewComments = append([]gitea.Comment(nil), d.ReviewComments...)
+	omittedCount, omittedBytes := 0, 0
+	for {
+		user := reviewContext(owner, repo, d, bot, true)
+		if len(user) <= limit {
+			return user, omittedCount, omittedBytes
+		}
+
+		// Drop the largest history entry first, preserving shorter discussion
+		// that may still help review the current changes.
+		group, index, largest := -1, -1, -1
+		for i, review := range d.Reviews {
+			if len(review.Body) > largest {
+				group, index, largest = 0, i, len(review.Body)
+			}
+		}
+		for i, comment := range d.IssueComments {
+			if len(comment.Body) > largest {
+				group, index, largest = 1, i, len(comment.Body)
+			}
+		}
+		for i, comment := range d.ReviewComments {
+			if len(comment.Body) > largest {
+				group, index, largest = 2, i, len(comment.Body)
+			}
+		}
+		if group < 0 {
+			return reviewContext(owner, repo, d, bot, false), omittedCount, omittedBytes
+		}
+		switch group {
+		case 0:
+			omittedBytes += len(d.Reviews[index].Body)
+			d.Reviews = append(d.Reviews[:index], d.Reviews[index+1:]...)
+		case 1:
+			omittedBytes += len(d.IssueComments[index].Body)
+			d.IssueComments = append(d.IssueComments[:index], d.IssueComments[index+1:]...)
+		case 2:
+			omittedBytes += len(d.ReviewComments[index].Body)
+			d.ReviewComments = append(d.ReviewComments[:index], d.ReviewComments[index+1:]...)
+		}
+		omittedCount++
+	}
+}
+
 func botSuffix(u gitea.User, bot string) string {
 	if strings.EqualFold(userName(u), bot) {
 		return " (Giteye)"
