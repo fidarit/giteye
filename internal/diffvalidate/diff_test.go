@@ -2,7 +2,7 @@ package diffvalidate
 
 import "testing"
 
-func TestValidateMapsAbsoluteNewLinesToDiffPositions(t *testing.T) {
+func TestValidateKeepsAbsoluteNewFileLines(t *testing.T) {
 	diff := `diff --git a/a.go b/a.go
 index 000..111 100644
 --- a/a.go
@@ -21,12 +21,12 @@ index 000..111 100644
 		t.Fatalf("unexpected validated comments: %#v", got)
 	}
 	positions := GiteaComments(diff, got)
-	if len(positions) != 1 || positions[0].Position != 3 {
-		t.Fatalf("unexpected Gitea position: %#v", positions)
+	if len(positions) != 1 || positions[0].Line != 3 {
+		t.Fatalf("unexpected Gitea line: %#v", positions)
 	}
-	// The second hunk continues the diff position count rather than resetting it.
+	// Later hunks keep using absolute new-file line numbers.
 	all := GiteaComments(diff, []Comment{{Path: "a.go", Line: 21, Body: "changed"}})
-	if len(all) != 1 || all[0].Position != 6 {
-		t.Fatalf("unexpected later hunk position: %#v", all)
+	if len(all) != 1 || all[0].Line != 21 {
+		t.Fatalf("unexpected later hunk line: %#v", all)
 	}
 }

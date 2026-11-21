@@ -14,19 +14,16 @@ type Comment struct {
 	Body string `json:"body"`
 }
 
-// Positions maps new-file line numbers to Gitea review new_position values.
-// Gitea defines new_position as the line position within the unified diff, not
-// the absolute file line number; context and added lines advance that position.
-func Positions(diff string) map[string]map[int]int {
-	result := map[string]map[int]int{}
+// DiffLines records new-file line numbers that are part of unified diff hunks.
+func DiffLines(diff string) map[string]map[int]struct{} {
+	result := map[string]map[int]struct{}{}
 	s := bufio.NewScanner(strings.NewReader(diff))
 	s.Buffer(make([]byte, 4096), len(diff)+1)
-	path, newLine, pos, inHunk := "", 0, 0, false
+	path, newLine, inHunk := "", 0, false
 	for s.Scan() {
 		line := s.Text()
 		if strings.HasPrefix(line, "diff --git ") {
 			path = ""
-			pos = 0
 			inHunk = false
 			continue
 		}
@@ -65,21 +62,18 @@ func Positions(diff string) map[string]map[int]int {
 		}
 		switch line[0] {
 		case ' ':
-			pos++
 			if result[path] == nil {
-				result[path] = map[int]int{}
+				result[path] = map[int]struct{}{}
 			}
-			result[path][newLine] = pos
+			result[path][newLine] = struct{}{}
 			newLine++
 		case '+':
-			pos++
 			if result[path] == nil {
-				result[path] = map[int]int{}
+				result[path] = map[int]struct{}{}
 			}
-			result[path][newLine] = pos
+			result[path][newLine] = struct{}{}
 			newLine++
 		case '-':
-			pos++
 		default:
 			inHunk = false
 		}
@@ -88,13 +82,13 @@ func Positions(diff string) map[string]map[int]int {
 }
 
 func Validate(diff string, comments []Comment) []Comment {
-	positions := Positions(diff)
+	diffLines := DiffLines(diff)
 	out := make([]Comment, 0, len(comments))
 	for _, c := range comments {
 		if c.Path == "" || c.Line < 1 || strings.TrimSpace(c.Body) == "" {
 			continue
 		}
-		if _, ok := positions[c.Path][c.Line]; ok {
+		if _, ok := diffLines[c.Path][c.Line]; ok {
 			out = append(out, c)
 		}
 	}
@@ -102,17 +96,16 @@ func Validate(diff string, comments []Comment) []Comment {
 }
 
 func GiteaComments(diff string, comments []Comment) []gitea.InlineComment {
-	positions := Positions(diff)
+	diffLines := DiffLines(diff)
 	out := make([]gitea.InlineComment, 0, len(comments))
 	for _, c := range comments {
 		if c.Path == "" || c.Line < 1 || strings.TrimSpace(c.Body) == "" {
 			continue
 		}
-		p, ok := positions[c.Path][c.Line]
-		if !ok {
+		if _, ok := diffLines[c.Path][c.Line]; !ok {
 			continue
 		}
-		out = append(out, gitea.InlineComment{Path: c.Path, Body: c.Body, Position: p})
+		out = append(out, gitea.InlineComment{Path: c.Path, Body: c.Body, Line: c.Line})
 	}
 	return out
 }

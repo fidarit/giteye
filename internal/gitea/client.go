@@ -91,11 +91,11 @@ type Comment struct {
 	CreatedAt string `json:"created_at"`
 }
 
-// InlineComment is a validated Gitea review comment with a unified-diff position.
+// InlineComment is a validated Gitea review comment on a new-file line.
 type InlineComment struct {
-	Path     string
-	Body     string
-	Position int
+	Path string
+	Body string
+	Line int
 }
 
 type Review struct {
@@ -235,7 +235,7 @@ func (c *Client) CreateReview(ctx context.Context, owner, repo string, number in
 	}
 	apiComments := make([]sdk.CreatePullReviewComment, 0, len(comments))
 	for _, comment := range comments {
-		apiComments = append(apiComments, sdk.CreatePullReviewComment{Path: comment.Path, Body: comment.Body, NewLineNum: int64(comment.Position)})
+		apiComments = append(apiComments, sdk.CreatePullReviewComment{Path: comment.Path, Body: comment.Body, NewLineNum: int64(comment.Line)})
 	}
 	_, _, err := c.api.PullRequests.CreatePullReview(ctx, owner, repo, number, sdk.CreatePullReviewOptions{CommitID: commit, State: sdk.ReviewStateType(event), Body: body, Comments: apiComments})
 	if err != nil {
