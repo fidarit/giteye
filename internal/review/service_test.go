@@ -48,6 +48,33 @@ func TestValidateReviewOutput(t *testing.T) {
 	}
 }
 
+func TestHasUnresolvedBotComments(t *testing.T) {
+	resolver := &gitea.User{Login: "alice"}
+	tests := []struct {
+		name     string
+		comments []gitea.Comment
+		want     bool
+	}{
+		{name: "no bot comments"},
+		{name: "unresolved bot finding", comments: []gitea.Comment{{User: gitea.User{Login: "giteye"}, ReviewID: 1, Path: "a.go", Position: 4}}, want: true},
+		{name: "resolved thread including bot reply", comments: []gitea.Comment{
+			{User: gitea.User{Login: "giteye"}, ReviewID: 1, Path: "a.go", Position: 4, Resolver: resolver},
+			{User: gitea.User{Login: "giteye"}, ReviewID: 1, Path: "a.go", Position: 4},
+		}},
+		{name: "another unresolved bot thread", comments: []gitea.Comment{
+			{User: gitea.User{Login: "giteye"}, ReviewID: 1, Path: "a.go", Position: 4, Resolver: resolver},
+			{User: gitea.User{Login: "giteye"}, ReviewID: 2, Path: "b.go", Position: 8},
+		}, want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := hasUnresolvedBotComments(test.comments, "giteye"); got != test.want {
+				t.Fatalf("hasUnresolvedBotComments() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestReplyLookupRequiresBotCommentAtSameReviewPosition(t *testing.T) {
 	comments := []gitea.Comment{
 		{ID: 10, Body: "bot finding", User: gitea.User{Login: "giteye"}, ReviewID: 7, Path: "main.go", Position: 14, CreatedAt: "2026-11-17T04:40:00Z"},

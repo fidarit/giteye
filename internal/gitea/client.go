@@ -68,6 +68,7 @@ type PullRequest struct {
 	Title   string `json:"title"`
 	Body    string `json:"body"`
 	State   string `json:"state"`
+	Draft   bool   `json:"draft"`
 	HTMLURL string `json:"html_url"`
 	Base    struct {
 		Ref string `json:"ref"`
@@ -87,6 +88,7 @@ type Comment struct {
 	Path      string `json:"path"`
 	Position  int    `json:"position"`
 	ReviewID  int64  `json:"pull_request_review_id"`
+	Resolver  *User  `json:"-"`
 	HTMLURL   string `json:"html_url"`
 	CreatedAt string `json:"created_at"`
 }
@@ -134,7 +136,7 @@ func (c *Client) Pull(ctx context.Context, owner, repo string, number int64) (Pu
 	if err != nil {
 		return PullRequest{}, fmt.Errorf("get pull request %s/%s#%d: %w", owner, repo, number, err)
 	}
-	out := PullRequest{Number: p.Index, Title: p.Title, Body: p.Body, State: string(p.State), HTMLURL: p.HTMLURL}
+	out := PullRequest{Number: p.Index, Title: p.Title, Body: p.Body, State: string(p.State), Draft: p.Draft, HTMLURL: p.HTMLURL}
 	if p.Base != nil {
 		out.Base.Ref, out.Base.SHA = p.Base.Ref, p.Base.Sha
 	}
@@ -222,6 +224,10 @@ func (c *Client) ReviewComments(ctx context.Context, owner, repo string, number 
 			}
 			if item.Reviewer != nil {
 				comment.User = fromSDKUser(item.Reviewer)
+			}
+			if item.Resolver != nil {
+				resolver := fromSDKUser(item.Resolver)
+				comment.Resolver = &resolver
 			}
 			out = append(out, comment)
 		}

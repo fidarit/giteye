@@ -281,6 +281,11 @@ func (s *Service) run(ctx context.Context, o, r string, n int64, kind webhook.Tr
 			if err := s.gitea.ResolveReviewComment(ctx, o, r, targetID); err != nil {
 				return result.Usage, err
 			}
+			reviewUsage, err := s.reviewIfAllBotThreadsResolved(ctx, o, r, n, e)
+			result.Usage = addUsage(result.Usage, reviewUsage)
+			if err != nil {
+				return result.Usage, err
+			}
 		}
 		return result.Usage, nil
 	}
@@ -293,6 +298,51 @@ func (s *Service) run(ctx context.Context, o, r string, n int64, kind webhook.Tr
 		event = gitea.ReviewEventApprove
 	}
 	return result.Usage, s.gitea.CreateReview(ctx, o, r, n, d.PR.Head.SHA, event, result.Summary, comments)
+}
+
+func (s *Service) reviewIfAllBotThreadsResolved(ctx context.Context, owner, repo string, number int64, event webhook.Event) (llm.Usage, error) {
+	d, err := s.load(ctx, owner, repo, number, false)
+	if err != nil {
+		return llm.Usage{}, err
+	}
+	if d.PR.State != "open" || d.PR.Draft || hasUnresolvedBotComments(d.ReviewComments, s.cfg.Gitea.BotUsername) {
+		return llm.Usage{}, nil
+	}
+	return s.run(ctx, owner, repo, number, webhook.TriggerReviewRequest, event)
+}
+
+func hasUnresolvedBotComments(comments []gitea.Comment, bot string) bool {
+	resolvedThreads := make(map[string]bool)
+	for _, comment := range comments {
+		if !strings.EqualFold(userName(comment.User), bot) {
+			continue
+		}
+		key := threadKey(comment)
+		if comment.Resolver != nil {
+			resolvedThreads[key] = true
+		}
+	}
+	for _, comment := range comments {
+		if strings.EqualFold(userName(comment.User), bot) && !resolvedThreads[threadKey(comment)] {
+			return true
+		}
+	}
+	return false
+}
+
+func threadKey(comment gitea.Comment) string {
+	return fmt.Sprintf("%d/%s/%d", comment.ReviewID, comment.Path, comment.Position)
+}
+
+func addUsage(a, b llm.Usage) llm.Usage {
+	a.ToolCalls += b.ToolCalls
+	a.ToolRounds += b.ToolRounds
+	a.InputTokens += b.InputTokens
+	a.OutputTokens += b.OutputTokens
+	a.TotalTokens += b.TotalTokens
+	a.CachedInput += b.CachedInput
+	a.Available = a.Available || b.Available
+	return a
 }
 
 func validateReviewOutput(event, summary string, comments []gitea.InlineComment) error {
