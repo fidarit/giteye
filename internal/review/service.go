@@ -277,14 +277,21 @@ func (s *Service) run(ctx context.Context, o, r string, n int64, kind webhook.Tr
 		return result.Usage, s.gitea.Reply(ctx, o, r, n, targetID, threadReply)
 	}
 	comments := diffvalidate.GiteaComments(d.Diff, toDiffComments(result.Comments))
-	if len(comments) == 0 && strings.TrimSpace(result.Summary) == "" {
-		return result.Usage, errors.New("AI returned neither a review summary nor valid inline comments")
+	if err := validateReviewOutput(result.Event, result.Summary, comments); err != nil {
+		return result.Usage, err
 	}
 	event := gitea.ReviewEventComment
 	if result.Event == "APPROVE" && len(comments) == 0 {
 		event = gitea.ReviewEventApprove
 	}
 	return result.Usage, s.gitea.CreateReview(ctx, o, r, n, d.PR.Head.SHA, event, result.Summary, comments)
+}
+
+func validateReviewOutput(event, summary string, comments []gitea.InlineComment) error {
+	if len(comments) == 0 && strings.TrimSpace(summary) == "" && event != "APPROVE" {
+		return errors.New("AI returned neither a review summary nor valid inline comments")
+	}
+	return nil
 }
 
 func (s *Service) discoverMCPTools(ctx context.Context) (*mcpbridge.Session, []llm.Tool, map[string]string, error) {
@@ -484,11 +491,9 @@ func resolveThreadReply(eventComment webhook.Comment, actor string, comments []g
 		if c.CreatedAt != "" && reply.CreatedAt != "" && c.CreatedAt > reply.CreatedAt {
 			continue
 		}
-		if root.ID != 0 {
-			// Multiple bot comments at the same diff position are ambiguous.
-			return gitea.Comment{}, gitea.Comment{}, false
+		if root.ID == 0 || (c.CreatedAt != "" && (root.CreatedAt == "" || c.CreatedAt < root.CreatedAt)) || (c.CreatedAt == root.CreatedAt && c.ID < root.ID) {
+			root = c
 		}
-		root = c
 	}
 	return root, reply, root.ID != 0
 }
