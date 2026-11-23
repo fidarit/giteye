@@ -252,6 +252,13 @@ func (c *Client) Reply(ctx context.Context, owner, repo string, number, commentI
 	return nil
 }
 
+func (c *Client) ResolveReviewComment(ctx context.Context, owner, repo string, commentID int64) error {
+	if _, err := c.api.PullRequests.ResolvePullReviewComment(ctx, owner, repo, commentID); err != nil {
+		return fmt.Errorf("resolve review comment %d on %s/%s: %w", commentID, owner, repo, err)
+	}
+	return nil
+}
+
 func (c *Client) FailureComment(ctx context.Context, owner, repo string, number int64, body string) error {
 	_, _, err := c.api.Issues.CreateIssueComment(ctx, owner, repo, number, sdk.CreateIssueCommentOption{Body: body})
 	if err != nil {

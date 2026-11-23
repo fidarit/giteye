@@ -23,8 +23,8 @@ Return exactly one valid JSON object, without markdown or surrounding text:
 {"event":"COMMENT","summary":"...","comments":[{"path":"...","line":1,"body":"..."}],"thread_reply":null}
 For full reviews, put findings without valid inline anchors in summary. Do not duplicate inline comments there. Use an empty summary when appropriate. Set "thread_reply" to null.
 For existing Giteye threads, read the full thread and current diff. Return:
-{"event":"COMMENT","summary":"","comments":[],"thread_reply":"..."}
-Acknowledge valid findings or Giteye mistakes. Answer disputes with code evidence. State whether changed code fixes, preserves, or changes the finding. Do not blindly defend previous findings or request changes.
+{"event":"COMMENT","summary":"","comments":[],"thread_reply":"...","resolve_thread":false}
+Acknowledge valid findings or Giteye mistakes. Answer disputes with code evidence. State whether changed code fixes, preserves, or changes the finding. Do not blindly defend previous findings or request changes. Set "resolve_thread" to true only when the original finding is no longer applicable (because it was fixed or withdrawn); otherwise set it to false. If the user asks to accept the pull request but the finding remains valid, explain that and do not resolve the thread.
 Write the review in the requested language.`
 
 func Build(override, addition, language string) string {

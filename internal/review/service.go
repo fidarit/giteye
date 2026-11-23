@@ -274,7 +274,15 @@ func (s *Service) run(ctx context.Context, o, r string, n int64, kind webhook.Tr
 				return result.Usage, err
 			}
 		}
-		return result.Usage, s.gitea.Reply(ctx, o, r, n, targetID, threadReply)
+		if err := s.gitea.Reply(ctx, o, r, n, targetID, threadReply); err != nil {
+			return result.Usage, err
+		}
+		if result.ResolveThread {
+			if err := s.gitea.ResolveReviewComment(ctx, o, r, targetID); err != nil {
+				return result.Usage, err
+			}
+		}
+		return result.Usage, nil
 	}
 	comments := diffvalidate.GiteaComments(d.Diff, toDiffComments(result.Comments))
 	if err := validateReviewOutput(result.Event, result.Summary, comments); err != nil {

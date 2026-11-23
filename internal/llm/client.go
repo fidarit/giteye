@@ -29,11 +29,12 @@ type Comment struct {
 }
 
 type Result struct {
-	Event       string    `json:"event"`
-	Summary     string    `json:"summary"`
-	Comments    []Comment `json:"comments"`
-	ThreadReply *string   `json:"thread_reply"`
-	Usage       Usage     `json:"-"`
+	Event         string    `json:"event"`
+	Summary       string    `json:"summary"`
+	Comments      []Comment `json:"comments"`
+	ThreadReply   *string   `json:"thread_reply"`
+	ResolveThread bool      `json:"resolve_thread"`
+	Usage         Usage     `json:"-"`
 }
 
 type Usage struct {
