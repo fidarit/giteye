@@ -327,6 +327,10 @@ func (s *Service) reviewLargeDiff(ctx context.Context, system, owner, repo strin
 	var combined llm.Result
 	combined.Event = "APPROVE"
 	seen := make(map[string]struct{})
+	type chunkResult struct {
+		result llm.Result
+	}
+	results := make([]chunkResult, 0, len(chunks))
 	for i, diffChunk := range chunks {
 		chunkData := d
 		chunkData.Reviews = base.Reviews
@@ -345,9 +349,7 @@ func (s *Service) reviewLargeDiff(ctx context.Context, system, owner, repo strin
 		if result.Event != "APPROVE" || strings.TrimSpace(result.Summary) != "" || len(result.Comments) > 0 {
 			combined.Event = "COMMENT"
 		}
-		if strings.TrimSpace(result.Summary) != "" {
-			combined.Summary = appendSummary(combined.Summary, result.Summary)
-		}
+		results = append(results, chunkResult{result: result})
 		for _, comment := range result.Comments {
 			key := fmt.Sprintf("%s\x00%d\x00%s", comment.Path, comment.Line, comment.Body)
 			if _, ok := seen[key]; ok {
@@ -367,7 +369,24 @@ func (s *Service) reviewLargeDiff(ctx context.Context, system, owner, repo strin
 			base.IssueComments = append(base.IssueComments, gitea.Comment{Body: fmt.Sprintf("Earlier diff segment %d/%d findings:%s", i+1, len(chunks), findings.String())})
 		}
 	}
+	chunkResults := make([]llm.Result, len(results))
+	for i, item := range results {
+		chunkResults[i] = item.result
+	}
+	combined.Summary = aggregateChunkSummaries(chunkResults)
 	return combined, nil
+}
+
+func aggregateChunkSummaries(results []llm.Result) string {
+	var summary string
+	for i, result := range results {
+		if strings.TrimSpace(result.Summary) == "" {
+			continue
+		}
+		segmentSummary := fmt.Sprintf("Diff segment %d/%d: %s", i+1, len(results), strings.TrimSpace(result.Summary))
+		summary = appendSummary(summary, segmentSummary)
+	}
+	return summary
 }
 
 func appendSummary(current, next string) string {

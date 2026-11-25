@@ -8,6 +8,7 @@ import (
 	"giteye/internal/config"
 	"giteye/internal/diffvalidate"
 	"giteye/internal/gitea"
+	"giteye/internal/llm"
 	"giteye/internal/webhook"
 )
 
@@ -44,6 +45,44 @@ func TestValidateReviewOutput(t *testing.T) {
 			err := validateReviewOutput(test.event, test.summary, test.comments)
 			if (err != nil) != test.wantErr {
 				t.Fatalf("validateReviewOutput() error = %v, wantErr %v", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestSegmentedReviewSummariesStayScoped(t *testing.T) {
+	tests := []struct {
+		name    string
+		results []llm.Result
+		want    []string
+	}{
+		{
+			name: "empty segment alongside finding",
+			results: []llm.Result{
+				{Summary: "No actionable problems found in the shown segment."},
+				{Summary: "The changed path can panic.", Comments: []llm.Comment{{Path: "main.go", Line: 12, Body: "This can panic."}}},
+			},
+			want: []string{"Diff segment 1/2: No actionable problems found in the shown segment.", "Diff segment 2/2: The changed path can panic."},
+		},
+		{
+			name: "no findings in any segment",
+			results: []llm.Result{
+				{Summary: "No actionable problems found in the shown segment."},
+				{Summary: "No actionable issues found."},
+			},
+			want: []string{"Diff segment 1/2: No actionable problems found in the shown segment.", "Diff segment 2/2: No actionable issues found."},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := aggregateChunkSummaries(test.results)
+			for _, want := range test.want {
+				if !strings.Contains(got, want) {
+					t.Errorf("combined summary %q does not contain %q", got, want)
+				}
+			}
+			if test.name == "empty segment alongside finding" && strings.Count(got, "Diff segment") != 2 {
+				t.Errorf("combined summary %q does not keep both segment scopes", got)
 			}
 		})
 	}
