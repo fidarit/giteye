@@ -35,6 +35,7 @@ type Service struct {
 	cancel  context.CancelFunc
 }
 
+// NewService creates a review service using the supplied configuration.
 func NewService(c config.Config, logger *slog.Logger) (*Service, error) {
 	c.Limits = c.Limits.WithDefaults()
 	if logger == nil {
@@ -60,11 +61,13 @@ func NewService(c config.Config, logger *slog.Logger) (*Service, error) {
 	}, nil
 }
 
+// Shutdown stops accepting review work and waits for active reviews to finish.
 func (s *Service) Shutdown(ctx context.Context) error {
 	s.cancel()
 	return s.manager.Shutdown(ctx)
 }
 
+// Handler returns the HTTP handler for health checks and Gitea webhooks.
 func (s *Service) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -210,10 +213,12 @@ func (s *Service) run(ctx context.Context, o, r string, n int64, kind webhook.Tr
 	user := reviewContext(o, r, d, s.cfg.Gitea.BotUsername, includeHistory)
 	omittedHistory := 0
 	omittedHistoryBytes := 0
+	contextTooLarge := false
 	if len(user) > s.cfg.Limits.ReviewContextBytes && includeHistory {
-		user, omittedHistory, omittedHistoryBytes = reviewContextWithinLimit(o, r, d, s.cfg.Gitea.BotUsername, s.cfg.Limits.ReviewContextBytes)
+		d, user, omittedHistory, omittedHistoryBytes = reviewContextWithinLimit(o, r, d, s.cfg.Gitea.BotUsername, s.cfg.Limits.ReviewContextBytes)
+		contextTooLarge = len(user) > s.cfg.Limits.ReviewContextBytes
 		if omittedHistory > 0 {
-			s.log.Warn("omitted review history entries to fit context limit", "pr", fmt.Sprintf("%s/%s#%d", o, r, n), "count", omittedHistory, "bytes", omittedHistoryBytes)
+			s.log.Warn("omitted review history entries to reduce context size", "pr", fmt.Sprintf("%s/%s#%d", o, r, n), "count", omittedHistory, "bytes", omittedHistoryBytes)
 		}
 	}
 	var targetID int64
@@ -225,7 +230,7 @@ func (s *Service) run(ctx context.Context, o, r string, n int64, kind webhook.Tr
 		targetID = root.ID
 		user += "\n\nActive bot thread:\n" + threadContext(root, reply, d.ReviewComments)
 	}
-	if len(user) > s.cfg.Limits.ReviewContextBytes {
+	if len(user) > s.cfg.Limits.ReviewContextBytes && (kind == webhook.TriggerThreadReply || !contextTooLarge) {
 		return llm.Usage{}, fmt.Errorf("review context is %d bytes and exceeds the %d-byte safety limit", len(user), s.cfg.Limits.ReviewContextBytes)
 	}
 	session, tools, toolNames, err := s.discoverMCPTools(ctx)
@@ -256,7 +261,12 @@ func (s *Service) run(ctx context.Context, o, r string, n int64, kind webhook.Tr
 			return value, err
 		}
 	}
-	result, err := s.ai.Review(ctx, system, user, tools, call)
+	var result llm.Result
+	if contextTooLarge {
+		result, err = s.reviewLargeDiff(ctx, system, o, r, d, tools, call)
+	} else {
+		result, err = s.ai.Review(ctx, system, user, tools, call)
+	}
 	if err != nil {
 		return result.Usage, err
 	}
@@ -298,6 +308,73 @@ func (s *Service) run(ctx context.Context, o, r string, n int64, kind webhook.Tr
 		event = gitea.ReviewEventApprove
 	}
 	return result.Usage, s.gitea.CreateReview(ctx, o, r, n, d.PR.Head.SHA, event, result.Summary, comments)
+}
+
+func (s *Service) reviewLargeDiff(ctx context.Context, system, owner, repo string, d contextData, tools []llm.Tool, call func(context.Context, string, map[string]any) (any, error)) (llm.Result, error) {
+	base := d
+	base.Diff = ""
+	base, historyContext, _, _ := reviewContextWithinLimit(owner, repo, base, s.cfg.Gitea.BotUsername, s.cfg.Limits.ReviewContextBytes)
+	if len(historyContext) > s.cfg.Limits.ReviewContextBytes {
+		return llm.Result{}, fmt.Errorf("PR metadata exceeds the %d-byte safety limit", s.cfg.Limits.ReviewContextBytes)
+	}
+	contextLimit := s.cfg.Limits.ReviewContextBytes - len(historyContext)
+	chunks, err := splitDiff(d.Diff, contextLimit)
+	if err != nil {
+		return llm.Result{}, err
+	}
+	s.log.Info("reviewing oversized diff in segments", "pr", fmt.Sprintf("%s/%s#%d", owner, repo, d.PR.Number), "segments", len(chunks), "context_limit_bytes", s.cfg.Limits.ReviewContextBytes)
+	chunkSystem := system + "\n\nReview this diff segment only. Review every change shown in this segment, but do not make claims about omitted segments or give a pull-request-wide approval."
+	var combined llm.Result
+	combined.Event = "APPROVE"
+	seen := make(map[string]struct{})
+	for i, diffChunk := range chunks {
+		chunkData := d
+		chunkData.Reviews = base.Reviews
+		chunkData.IssueComments = base.IssueComments
+		chunkData.ReviewComments = base.ReviewComments
+		chunkData.Diff = diffChunk
+		_, user, _, _ := reviewContextWithinLimit(owner, repo, chunkData, s.cfg.Gitea.BotUsername, s.cfg.Limits.ReviewContextBytes)
+		if len(user) > s.cfg.Limits.ReviewContextBytes {
+			return combined, fmt.Errorf("review diff chunk %d of %d exceeds the %d-byte safety limit", i+1, len(chunks), s.cfg.Limits.ReviewContextBytes)
+		}
+		result, err := s.ai.Review(ctx, chunkSystem, user, tools, call)
+		combined.Usage = addUsage(combined.Usage, result.Usage)
+		if err != nil {
+			return combined, fmt.Errorf("review diff chunk %d of %d: %w", i+1, len(chunks), err)
+		}
+		if result.Event != "APPROVE" || strings.TrimSpace(result.Summary) != "" || len(result.Comments) > 0 {
+			combined.Event = "COMMENT"
+		}
+		if strings.TrimSpace(result.Summary) != "" {
+			combined.Summary = appendSummary(combined.Summary, result.Summary)
+		}
+		for _, comment := range result.Comments {
+			key := fmt.Sprintf("%s\x00%d\x00%s", comment.Path, comment.Line, comment.Body)
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			combined.Comments = append(combined.Comments, comment)
+		}
+		if strings.TrimSpace(result.Summary) != "" {
+			base.IssueComments = append(base.IssueComments, gitea.Comment{Body: fmt.Sprintf("Earlier diff segment %d/%d summary: %s", i+1, len(chunks), result.Summary)})
+		}
+		if len(result.Comments) > 0 {
+			var findings strings.Builder
+			for _, comment := range result.Comments {
+				fmt.Fprintf(&findings, "\n%s:%d: %s", comment.Path, comment.Line, comment.Body)
+			}
+			base.IssueComments = append(base.IssueComments, gitea.Comment{Body: fmt.Sprintf("Earlier diff segment %d/%d findings:%s", i+1, len(chunks), findings.String())})
+		}
+	}
+	return combined, nil
+}
+
+func appendSummary(current, next string) string {
+	if current == "" {
+		return next
+	}
+	return current + "\n\n" + next
 }
 
 func (s *Service) reviewIfAllBotThreadsResolved(ctx context.Context, owner, repo string, number int64, event webhook.Event) (llm.Usage, error) {
@@ -454,8 +531,9 @@ func toDiffComments(in []llm.Comment) []diffvalidate.Comment {
 }
 func reviewContext(owner, repo string, d contextData, bot string, includeHistory bool) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Repository: %s/%s\nPull request: #%d %s\nURL: %s\nBase: %s (%s)\nHead: %s (%s)\nDescription:\n%s\n\nDiff:\n%s\n", owner, repo, d.PR.Number, d.PR.Title, d.PR.HTMLURL, d.PR.Base.Ref, d.PR.Base.SHA, d.PR.Head.Ref, d.PR.Head.SHA, d.PR.Body, d.Diff)
+	fmt.Fprintf(&b, "Repository: %s/%s\nPull request: #%d %s\nURL: %s\nBase: %s (%s)\nHead: %s (%s)\nDescription:\n%s\n", owner, repo, d.PR.Number, d.PR.Title, d.PR.HTMLURL, d.PR.Base.Ref, d.PR.Base.SHA, d.PR.Head.Ref, d.PR.Head.SHA, d.PR.Body)
 	if !includeHistory {
+		fmt.Fprintf(&b, "\nDiff:\n%s\n", d.Diff)
 		return b.String()
 	}
 	b.WriteString("\nPrior reviews and discussion (use as history; do not repeat resolved findings blindly):\n")
@@ -467,10 +545,11 @@ func reviewContext(owner, repo string, d contextData, bot string, includeHistory
 	for _, c := range comments {
 		fmt.Fprintf(&b, "Comment #%d by %s%s: %s\n", c.ID, userName(c.User), botSuffix(c.User, bot), c.Body)
 	}
+	fmt.Fprintf(&b, "\nDiff:\n%s\n", d.Diff)
 	return b.String()
 }
 
-func reviewContextWithinLimit(owner, repo string, d contextData, bot string, limit int) (string, int, int) {
+func reviewContextWithinLimit(owner, repo string, d contextData, bot string, limit int) (contextData, string, int, int) {
 	d.Reviews = append([]gitea.Review(nil), d.Reviews...)
 	d.IssueComments = append([]gitea.Comment(nil), d.IssueComments...)
 	d.ReviewComments = append([]gitea.Comment(nil), d.ReviewComments...)
@@ -478,7 +557,7 @@ func reviewContextWithinLimit(owner, repo string, d contextData, bot string, lim
 	for {
 		user := reviewContext(owner, repo, d, bot, true)
 		if len(user) <= limit {
-			return user, omittedCount, omittedBytes
+			return d, user, omittedCount, omittedBytes
 		}
 
 		// Drop the largest history entry first, preserving shorter discussion
@@ -500,7 +579,7 @@ func reviewContextWithinLimit(owner, repo string, d contextData, bot string, lim
 			}
 		}
 		if group < 0 {
-			return reviewContext(owner, repo, d, bot, false), omittedCount, omittedBytes
+			return d, reviewContext(owner, repo, d, bot, false), omittedCount, omittedBytes
 		}
 		switch group {
 		case 0:

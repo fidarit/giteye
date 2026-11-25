@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"giteye/internal/config"
+	"giteye/internal/diffvalidate"
 	"giteye/internal/gitea"
 	"giteye/internal/webhook"
 )
@@ -43,6 +44,89 @@ func TestValidateReviewOutput(t *testing.T) {
 			err := validateReviewOutput(test.event, test.summary, test.comments)
 			if (err != nil) != test.wantErr {
 				t.Fatalf("validateReviewOutput() error = %v, wantErr %v", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestReviewContextPutsHistoryBeforeDiff(t *testing.T) {
+	d := contextData{
+		Diff:    "diff-marker",
+		Reviews: []gitea.Review{{Body: "history-marker"}},
+	}
+	context := reviewContext("owner", "repo", d, "bot", true)
+	if strings.Index(context, "history-marker") > strings.Index(context, "diff-marker") {
+		t.Fatal("review context puts the diff before review history")
+	}
+}
+
+func TestSplitDiffPreservesChangedLineAnchors(t *testing.T) {
+	diff := "diff --git a/main.go b/main.go\nindex 000..111 100644\n--- a/main.go\n+++ b/main.go\n" +
+		"@@ -1,2 +1,3 @@\n package main\n+func first() {}\n \n" +
+		"@@ -10,2 +11,3 @@ function\n func existing() {}\n+func second() {}\n end\n"
+	chunks, err := splitDiff(diff, 145)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) < 2 {
+		t.Fatalf("splitDiff() returned %d chunks, want multiple", len(chunks))
+	}
+	want := diffvalidate.DiffLines(diff)
+	got := make(map[string]map[int]struct{})
+	for _, chunk := range chunks {
+		if len(chunk) > 145 {
+			t.Errorf("chunk has %d bytes, exceeds limit", len(chunk))
+		}
+		for path, lines := range diffvalidate.DiffLines(chunk) {
+			if got[path] == nil {
+				got[path] = make(map[int]struct{})
+			}
+			for line := range lines {
+				got[path][line] = struct{}{}
+			}
+		}
+	}
+	for path, lines := range want {
+		for line := range lines {
+			if _, ok := got[path][line]; !ok {
+				t.Errorf("split chunks lost changed line %s:%d", path, line)
+			}
+		}
+	}
+}
+
+func TestSplitDiffRejectsImpossibleBudgets(t *testing.T) {
+	if _, err := splitDiff("", 100); err == nil {
+		t.Fatal("splitDiff() accepted an empty diff")
+	}
+	diff := "diff --git a/main.go b/main.go\n--- a/main.go\n+++ b/main.go\n@@ -1 +1 @@\n-old\n+new\n"
+	if _, err := splitDiff(diff, 8); err == nil {
+		t.Fatal("splitDiff() accepted a hunk larger than the available context")
+	}
+}
+
+func TestSplitDiffPreservesZeroLengthHunkStarts(t *testing.T) {
+	tests := []struct {
+		name string
+		hunk string
+		line string
+		want string
+	}{
+		{name: "insertion", hunk: "@@ -3,0 +4,1 @@", line: "+added\n", want: "@@ -3,0 +4,1 @@"},
+		{name: "deletion", hunk: "@@ -4,1 +3,0 @@", line: "-removed\n", want: "@@ -4,1 +3,0 @@"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			diff := "diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n" + test.hunk + "\n" + test.line
+			chunks, err := splitDiff(diff, 1024)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(chunks) != 1 {
+				t.Fatalf("splitDiff() returned %d chunks, want 1", len(chunks))
+			}
+			if !strings.Contains(chunks[0], test.want) {
+				t.Errorf("split hunk header = %q, want %q", chunks[0], test.want)
 			}
 		})
 	}

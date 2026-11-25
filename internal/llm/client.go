@@ -64,6 +64,7 @@ type Client struct {
 	log *slog.Logger
 }
 
+// New creates a client for the configured OpenAI-compatible endpoint.
 func New(c Config) *Client {
 	if c.MaxToolRounds < 1 {
 		c.MaxToolRounds = 6
@@ -84,6 +85,8 @@ func New(c Config) *Client {
 	return &Client{cfg: c, api: &api, log: logger}
 }
 
+// Review requests a structured review from the model. Callers can improve
+// provider-side prompt caching by keeping stable context before changing input.
 func (c *Client) Review(ctx context.Context, system, user string, tools []Tool, call func(context.Context, string, map[string]any) (any, error)) (Result, error) {
 	messages := []openai.ChatCompletionMessageParamUnion{openai.SystemMessage(system), openai.UserMessage(user)}
 	jsonFormat := openai.ResponseFormatJSONObjectParam{Type: "json_object"}
